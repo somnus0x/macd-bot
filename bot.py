@@ -288,6 +288,32 @@ async def macd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+# === /coins ===
+
+async def coins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    # Group aliases by category
+    categories = {
+        "🟠 Major": ["BTC", "ETH", "SOL", "BNB", "XRP"],
+        "🔵 L1/L2": ["AVAX", "DOT", "ATOM", "NEAR", "APT", "SUI", "SEI"],
+        "⚡ DeFi/Infra": ["LINK", "ARB", "OP", "INJ", "TIA", "INIT"],
+        "🐕 Meme": ["DOGE"],
+        "🪙 Legacy": ["ADA", "MATIC"],
+    }
+
+    lines = ["🪙 *Supported Coins*", "━━━━━━━━━━━━━━━"]
+    for cat, coins in categories.items():
+        coin_str = "  ".join(f"`{c}`" for c in coins)
+        lines.append(f"\n{cat}\n{coin_str}")
+
+    lines.append(f"\n📊 {len(PAIR_ALIASES)} shortcuts total")
+    lines.append("Any Binance pair also works: `PEPEUSDT`, `WIFUSDT`, etc.")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 # === /price ===
 
 async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -453,7 +479,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /macd `[PAIR]` — MACD crossover\n"
         "  /rsi `[PAIR]` — RSI overbought/oversold\n\n"
         "💰 *Price*\n"
-        "  /price `[PAIR]` — price + 24h change\n\n"
+        "  /price `[PAIR]` — price + 24h change\n"
+        "  /coins — list supported coins\n\n"
         "🌡️ *Sentiment*\n"
         "  /fng — Fear & Greed index\n"
         "  /dom — BTC dominance\n\n"
@@ -502,6 +529,7 @@ async def post_init(application: Application):
         BotCommand("macd", "📊 MACD crossover check"),
         BotCommand("price", "💰 Price + 24h change"),
         BotCommand("rsi", "📉 RSI overbought/oversold"),
+        BotCommand("coins", "🪙 List supported coins"),
         BotCommand("fng", "😱 Fear & Greed index"),
         BotCommand("dom", "🏛️ BTC dominance"),
         BotCommand("start", "⚡ Show all commands"),
@@ -522,6 +550,7 @@ def main():
     app.add_handler(CommandHandler("macd", macd_command))
     app.add_handler(CommandHandler("price", price_command))
     app.add_handler(CommandHandler("rsi", rsi_command))
+    app.add_handler(CommandHandler("coins", coins_command))
     app.add_handler(CommandHandler("fng", fng_command))
     app.add_handler(CommandHandler("dom", dom_command))
     app.add_handler(CommandHandler("start", start_command))
