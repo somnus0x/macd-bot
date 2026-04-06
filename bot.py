@@ -21,8 +21,8 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 log = logging.getLogger(__name__)
@@ -191,6 +191,128 @@ def trend_emoji(change: float) -> str:
         return "💀"
 
 
+# === Inline coin picker ===
+
+PICKER_COINS = [
+    ["BTC", "ETH", "SOL", "BNB", "XRP"],
+    ["AVAX", "DOT", "ATOM", "NEAR", "LINK"],
+    ["APT", "SUI", "SEI", "ARB", "OP"],
+    ["INJ", "TIA", "INIT", "DOGE", "ADA"],
+]
+
+
+def coin_picker_keyboard(command: str) -> InlineKeyboardMarkup:
+    """Build inline button grid for a command. callback_data = 'cmd:PAIR'."""
+    rows = []
+    for row in PICKER_COINS:
+        rows.append([
+            InlineKeyboardButton(coin, callback_data=f"{command}:{coin}")
+            for coin in row
+        ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def coin_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline button taps like 'macd:BTC', 'rsi:ETH', 'price:SOL'."""
+    query = update.callback_query
+    if not query or not query.data:
+        return
+
+    parts = query.data.split(":", 1)
+    if len(parts) != 2 or parts[0] not in ("macd", "rsi", "price"):
+        return
+
+    cmd, coin = parts
+    pair = resolve_pair(coin)
+    await query.answer()
+
+    if cmd == "macd":
+        data = await fetch_klines(pair)
+        if not data:
+            await query.message.reply_text(f"❌ Can't fetch {pair}.")
+            return
+        closes = [float(c[4]) for c in data]
+        price = closes[-1]
+        result = compute_macd(closes)
+        if not result:
+            await query.message.reply_text(f"❌ Not enough data for {pair}.")
+            return
+        if result["cross"]:
+            emoji = "🟢" if result["cross"] == "BULLISH" else "🔴"
+            msg = (
+                f"{emoji} *{pair}* 1h MACD *{result['cross']}* cross\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"📊 MACD: `{result['macd']}` | Signal: `{result['signal']}`\n"
+                f"💰 Price: {fmt_price(price)}"
+            )
+        else:
+            bar = "▓" if result["diff"] > 0 else "░"
+            msg = (
+                f"⚡ *{pair}* — no cross\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"📊 MACD: `{result['macd']}`\n"
+                f"📈 Signal: `{result['signal']}`\n"
+                f"{bar} Histogram: `{result['histogram']}`\n"
+                f"💰 Price: {fmt_price(price)}"
+            )
+        await query.message.reply_text(msg, parse_mode="Markdown")
+
+    elif cmd == "rsi":
+        data = await fetch_klines(pair, interval="1h", limit=100)
+        if not data:
+            await query.message.reply_text(f"❌ Can't fetch {pair}.")
+            return
+        closes = [float(c[4]) for c in data]
+        price = closes[-1]
+        rsi = compute_rsi(closes)
+        if rsi is None:
+            await query.message.reply_text(f"❌ Not enough data for {pair}.")
+            return
+        if rsi >= 70:
+            zone = "🔴 OVERBOUGHT"
+        elif rsi >= 60:
+            zone = "🟡 warm"
+        elif rsi >= 40:
+            zone = "⚪ neutral"
+        elif rsi >= 30:
+            zone = "🟡 cool"
+        else:
+            zone = "🟢 OVERSOLD"
+        bar_filled = int(rsi / 5)
+        bar = "█" * bar_filled + "░" * (20 - bar_filled)
+        msg = (
+            f"📉 *{pair}* RSI(14) 1h\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"RSI: *{rsi}* — {zone}\n"
+            f"`[{bar}]`\n"
+            f"💰 Price: {fmt_price(price)}"
+        )
+        await query.message.reply_text(msg, parse_mode="Markdown")
+
+    elif cmd == "price":
+        ticker = await fetch_ticker(pair)
+        if not ticker:
+            await query.message.reply_text(f"❌ Can't fetch {pair}.")
+            return
+        price = float(ticker["lastPrice"])
+        change = float(ticker["priceChangePercent"])
+        high = float(ticker["highPrice"])
+        low = float(ticker["lowPrice"])
+        vol = float(ticker["quoteVolume"])
+        emoji = trend_emoji(change)
+        sign = "+" if change > 0 else ""
+        vol_str = f"${vol / 1e6:.1f}M" if vol > 1e6 else f"${vol:,.0f}"
+        msg = (
+            f"{emoji} *{pair}*\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"💰 Price: {fmt_price(price)} ({sign}{change:.2f}%)\n"
+            f"📈 24h High: {fmt_price(high)}\n"
+            f"📉 24h Low: {fmt_price(low)}\n"
+            f"📊 24h Volume: {vol_str}"
+        )
+        await query.message.reply_text(msg, parse_mode="Markdown")
+
+
 # === /macd ===
 
 async def macd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -251,8 +373,17 @@ async def macd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🔕 Stopped watching {pair}.\n📊 {len(chat_pairs)}/{MAX_WATCHES} slots used.")
         return
 
-    # /macd [PAIR]
-    pair = resolve_pair(args[0]) if args else "ETHUSDT"
+    # /macd (no pair) → show picker
+    if not args:
+        await update.message.reply_text(
+            "📊 *MACD* — pick a coin:",
+            parse_mode="Markdown",
+            reply_markup=coin_picker_keyboard("macd"),
+        )
+        return
+
+    # /macd PAIR
+    pair = resolve_pair(args[0])
     data = await fetch_klines(pair)
     if not data:
         await update.message.reply_text(f"❌ Can't fetch {pair}. Try: BTC, ETH, SOL, etc.")
@@ -320,8 +451,16 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     args = context.args or []
-    pair = resolve_pair(args[0]) if args else "BTCUSDT"
 
+    if not args:
+        await update.message.reply_text(
+            "💰 *Price* — pick a coin:",
+            parse_mode="Markdown",
+            reply_markup=coin_picker_keyboard("price"),
+        )
+        return
+
+    pair = resolve_pair(args[0])
     ticker = await fetch_ticker(pair)
     if not ticker:
         await update.message.reply_text(f"❌ Can't fetch {pair}. Try: BTC, ETH, SOL, etc.")
@@ -356,8 +495,16 @@ async def rsi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
     args = context.args or []
-    pair = resolve_pair(args[0]) if args else "BTCUSDT"
 
+    if not args:
+        await update.message.reply_text(
+            "📉 *RSI* — pick a coin:",
+            parse_mode="Markdown",
+            reply_markup=coin_picker_keyboard("rsi"),
+        )
+        return
+
+    pair = resolve_pair(args[0])
     data = await fetch_klines(pair, interval="1h", limit=100)
     if not data:
         await update.message.reply_text(f"❌ Can't fetch {pair}. Try: BTC, ETH, SOL, etc.")
@@ -554,6 +701,7 @@ def main():
     app.add_handler(CommandHandler("fng", fng_command))
     app.add_handler(CommandHandler("dom", dom_command))
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CallbackQueryHandler(coin_picker_callback))
 
     job_queue = app.job_queue
     job_queue.run_repeating(hourly_check, interval=3600, first=10)
