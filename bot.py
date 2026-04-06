@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 
 import httpx
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
@@ -27,7 +27,18 @@ log = logging.getLogger(__name__)
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 WATCHLIST_FILE = os.environ.get("WATCHLIST_FILE", "/tmp/macd_watchlist.json")
 MAX_WATCHES = 10
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+
+# Binance endpoints — try in order until one works.
+# Railway IPs in some US regions get blocked by api.binance.com.
+BINANCE_ENDPOINTS = [
+    "https://data-api.binance.vision/api/v3/klines",
+    "https://api.binance.us/api/v3/klines",
+    "https://api.binance.com/api/v3/klines",
+    "https://api1.binance.com/api/v3/klines",
+    "https://api2.binance.com/api/v3/klines",
+    "https://api3.binance.com/api/v3/klines",
+    "https://api4.binance.com/api/v3/klines",
+]
 
 
 # === MACD calculation ===
@@ -45,15 +56,13 @@ def ema(values: list[float], period: int) -> list[float]:
 
 def compute_macd(closes: list[float]) -> dict | None:
     """Compute MACD(12,26,9) from closing prices. Returns last 2 bars."""
-    if len(closes) < 35:  # Need at least 26 + 9 for signal line
+    if len(closes) < 35:
         return None
 
     ema12 = ema(closes, 12)
     ema26 = ema(closes, 26)
 
-    # Align: ema12 starts at index 11, ema26 at index 25
-    # MACD line = ema12 - ema26, aligned from index 25
-    offset = 26 - 12  # = 14
+    offset = 26 - 12
     macd_line = [ema12[i + offset] - ema26[i] for i in range(len(ema26))]
 
     if len(macd_line) < 9:
@@ -64,13 +73,11 @@ def compute_macd(closes: list[float]) -> dict | None:
     if len(signal_line) < 2:
         return None
 
-    # Last 2 bars
     macd_prev = macd_line[-2]
     macd_curr = macd_line[-1]
     sig_prev = signal_line[-2]
     sig_curr = signal_line[-1]
 
-    # Detect crossover
     cross = None
     if macd_prev <= sig_prev and macd_curr > sig_curr:
         cross = "BULLISH"
@@ -85,21 +92,34 @@ def compute_macd(closes: list[float]) -> dict | None:
     }
 
 
-# === Binance API ===
+# === Binance API with fallback ===
+
+async def fetch_klines(pair: str) -> list | None:
+    """Fetch 1h candles, trying multiple Binance endpoints."""
+    async with httpx.AsyncClient(timeout=10) as client:
+        for endpoint in BINANCE_ENDPOINTS:
+            try:
+                resp = await client.get(endpoint, params={
+                    "symbol": pair.upper(),
+                    "interval": "1h",
+                    "limit": 100,
+                })
+                if resp.status_code == 200:
+                    data = resp.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        return data
+            except (httpx.TimeoutException, httpx.ConnectError):
+                continue
+    return None
+
 
 async def fetch_macd(pair: str) -> dict | None:
     """Fetch 1h candles from Binance and compute MACD."""
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.get(BINANCE_KLINES, params={
-            "symbol": pair.upper(),
-            "interval": "1h",
-            "limit": 100,
-        })
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
+    data = await fetch_klines(pair)
+    if not data:
+        return None
 
-    closes = [float(c[4]) for c in data]  # index 4 = close price
+    closes = [float(c[4]) for c in data]
     price = closes[-1]
 
     result = compute_macd(closes)
@@ -129,6 +149,9 @@ def save_watchlist(wl: dict):
 
 async def macd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /macd command."""
+    if not update.message:
+        return
+
     args = context.args or []
     chat_id = str(update.effective_chat.id)
 
@@ -156,7 +179,6 @@ async def macd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(chat_pairs) >= MAX_WATCHES:
             await update.message.reply_text(f"Max {MAX_WATCHES} watches. Remove one first.")
             return
-        # Validate pair exists
         result = await fetch_macd(pair)
         if result is None:
             await update.message.reply_text(f"Can't fetch {pair}. Check the pair name (e.g. BTCUSDT, ETHUSDT).")
@@ -209,6 +231,21 @@ async def macd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg)
 
 
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command."""
+    if not update.message:
+        return
+    await update.message.reply_text(
+        "MACD Crossover Bot\n\n"
+        "/macd — check ETHUSDT now\n"
+        "/macd BTCUSDT — check specific pair\n"
+        "/macd watch BTCUSDT — hourly alerts\n"
+        "/macd stop BTCUSDT — remove alerts\n"
+        "/macd list — show watches\n\n"
+        "Works in groups. Uses Binance 1h candles. MACD(12,26,9)."
+    )
+
+
 # === Hourly cron check ===
 
 async def hourly_check(context: ContextTypes.DEFAULT_TYPE):
@@ -230,28 +267,36 @@ async def hourly_check(context: ContextTypes.DEFAULT_TYPE):
                 log.error(f"Error checking {pair} for {chat_id}: {e}")
 
 
+# === Post-init: set bot commands and disable privacy mode hint ===
+
+async def post_init(application: Application):
+    """Set bot commands so they show in Telegram's menu."""
+    await application.bot.set_my_commands([
+        BotCommand("macd", "Check MACD crossover (default ETHUSDT)"),
+        BotCommand("start", "Show help"),
+    ])
+    log.info("Bot commands registered.")
+
+
 # === Main ===
 
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .build()
+    )
 
     app.add_handler(CommandHandler("macd", macd_command))
-    app.add_handler(CommandHandler("start", lambda u, c: u.message.reply_text(
-        "MACD Crossover Bot\n\n"
-        "/macd — check ETHUSDT now\n"
-        "/macd BTCUSDT — check specific pair\n"
-        "/macd watch BTCUSDT — hourly alerts\n"
-        "/macd stop BTCUSDT — remove alerts\n"
-        "/macd list — show watches\n\n"
-        "Uses Binance 1h candles. MACD(12,26,9)."
-    )))
+    app.add_handler(CommandHandler("start", start_command))
 
     # Schedule hourly check
     job_queue = app.job_queue
     job_queue.run_repeating(hourly_check, interval=3600, first=10)
 
     log.info("MACD bot starting...")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
