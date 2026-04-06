@@ -176,6 +176,56 @@ def fmt_price(price: float) -> str:
         return f"${price:.6f}"
 
 
+def ascii_chart(closes: list[float], width: int = 24, height: int = 8) -> str:
+    """Render ASCII price chart using line-drawing characters. Last `width` candles."""
+    data = closes[-width:]
+    if len(data) < 2:
+        return ""
+    lo, hi = min(data), max(data)
+    spread = hi - lo
+    if spread == 0:
+        return "`" + "─" * width + "`"
+
+    # Map each data point to a row (0 = top = high, height-1 = bottom = low)
+    scaled = [round((hi - v) / spread * (height - 1)) for v in data]
+
+    rows = []
+    for row in range(height):
+        line = ""
+        for col in range(len(data)):
+            level = scaled[col]
+            if level == row:
+                # This data point sits on this row — draw the dot
+                line += "•"
+            elif col > 0:
+                # Draw connecting lines between adjacent points
+                prev_level = scaled[col - 1]
+                curr_level = scaled[col]
+                top = min(prev_level, curr_level)
+                bot = max(prev_level, curr_level)
+                if top < row < bot:
+                    line += "│"
+                else:
+                    line += " "
+            else:
+                line += " "
+        rows.append(line)
+
+    hi_label = fmt_price(hi)
+    lo_label = fmt_price(lo)
+    pad = max(len(hi_label), len(lo_label))
+    chart_lines = []
+    for i, row in enumerate(rows):
+        if i == 0:
+            chart_lines.append(f"{hi_label:>{pad}} ┤{row}")
+        elif i == height - 1:
+            chart_lines.append(f"{lo_label:>{pad}} ┤{row}")
+        else:
+            chart_lines.append(f"{' ' * pad} ┤{row}")
+
+    return "```\n" + "\n".join(chart_lines) + "\n```"
+
+
 def trend_emoji(change: float) -> str:
     if change > 5:
         return "🚀"
@@ -233,6 +283,7 @@ async def coin_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         closes = [float(c[4]) for c in data]
         price = closes[-1]
+        chart = ascii_chart(closes)
         result = compute_macd(closes)
         if not result:
             await query.message.reply_text(f"❌ Not enough data for {pair}.")
@@ -243,7 +294,8 @@ async def coin_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"{emoji} *{pair}* 1h MACD *{result['cross']}* cross\n"
                 f"━━━━━━━━━━━━━━━\n"
                 f"📊 MACD: `{result['macd']}` | Signal: `{result['signal']}`\n"
-                f"💰 Price: {fmt_price(price)}"
+                f"💰 Price: {fmt_price(price)}\n\n"
+                f"{chart}"
             )
         else:
             bar = "▓" if result["diff"] > 0 else "░"
@@ -253,7 +305,8 @@ async def coin_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYP
                 f"📊 MACD: `{result['macd']}`\n"
                 f"📈 Signal: `{result['signal']}`\n"
                 f"{bar} Histogram: `{result['histogram']}`\n"
-                f"💰 Price: {fmt_price(price)}"
+                f"💰 Price: {fmt_price(price)}\n\n"
+                f"{chart}"
             )
         await query.message.reply_text(msg, parse_mode="Markdown")
 
@@ -264,6 +317,7 @@ async def coin_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         closes = [float(c[4]) for c in data]
         price = closes[-1]
+        chart = ascii_chart(closes)
         rsi = compute_rsi(closes)
         if rsi is None:
             await query.message.reply_text(f"❌ Not enough data for {pair}.")
@@ -285,7 +339,8 @@ async def coin_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             f"━━━━━━━━━━━━━━━\n"
             f"RSI: *{rsi}* — {zone}\n"
             f"`[{bar}]`\n"
-            f"💰 Price: {fmt_price(price)}"
+            f"💰 Price: {fmt_price(price)}\n\n"
+            f"{chart}"
         )
         await query.message.reply_text(msg, parse_mode="Markdown")
 
@@ -294,6 +349,9 @@ async def coin_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         if not ticker:
             await query.message.reply_text(f"❌ Can't fetch {pair}.")
             return
+        # Fetch klines for chart
+        kline_data = await fetch_klines(pair)
+        chart = ascii_chart([float(c[4]) for c in kline_data]) if kline_data else ""
         price = float(ticker["lastPrice"])
         change = float(ticker["priceChangePercent"])
         high = float(ticker["highPrice"])
@@ -308,7 +366,8 @@ async def coin_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             f"💰 Price: {fmt_price(price)} ({sign}{change:.2f}%)\n"
             f"📈 24h High: {fmt_price(high)}\n"
             f"📉 24h Low: {fmt_price(low)}\n"
-            f"📊 24h Volume: {vol_str}"
+            f"📊 24h Volume: {vol_str}\n\n"
+            f"{chart}"
         )
         await query.message.reply_text(msg, parse_mode="Markdown")
 
@@ -391,6 +450,7 @@ async def macd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     closes = [float(c[4]) for c in data]
     price = closes[-1]
+    chart = ascii_chart(closes)
     result = compute_macd(closes)
 
     if not result:
@@ -403,7 +463,8 @@ async def macd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{emoji} *{pair}* 1h MACD *{result['cross']}* cross\n"
             f"━━━━━━━━━━━━━━━\n"
             f"📊 MACD: `{result['macd']}` | Signal: `{result['signal']}`\n"
-            f"💰 Price: {fmt_price(price)}"
+            f"💰 Price: {fmt_price(price)}\n\n"
+            f"{chart}"
         )
     else:
         bar = "▓" if result["diff"] > 0 else "░"
@@ -413,7 +474,8 @@ async def macd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"📊 MACD: `{result['macd']}`\n"
             f"📈 Signal: `{result['signal']}`\n"
             f"{bar} Histogram: `{result['histogram']}`\n"
-            f"💰 Price: {fmt_price(price)}"
+            f"💰 Price: {fmt_price(price)}\n\n"
+            f"{chart}"
         )
 
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -466,6 +528,9 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"❌ Can't fetch {pair}. Try: BTC, ETH, SOL, etc.")
         return
 
+    kline_data = await fetch_klines(pair)
+    chart = ascii_chart([float(c[4]) for c in kline_data]) if kline_data else ""
+
     price = float(ticker["lastPrice"])
     change = float(ticker["priceChangePercent"])
     high = float(ticker["highPrice"])
@@ -483,7 +548,8 @@ async def price_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"💰 Price: {fmt_price(price)} ({sign}{change:.2f}%)\n"
         f"📈 24h High: {fmt_price(high)}\n"
         f"📉 24h Low: {fmt_price(low)}\n"
-        f"📊 24h Volume: {vol_str}"
+        f"📊 24h Volume: {vol_str}\n\n"
+        f"{chart}"
     )
 
     await update.message.reply_text(msg, parse_mode="Markdown")
@@ -512,6 +578,7 @@ async def rsi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     closes = [float(c[4]) for c in data]
     price = closes[-1]
+    chart = ascii_chart(closes)
     rsi = compute_rsi(closes)
 
     if rsi is None:
@@ -537,7 +604,8 @@ async def rsi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"━━━━━━━━━━━━━━━\n"
         f"RSI: *{rsi}* — {zone}\n"
         f"`[{bar}]`\n"
-        f"💰 Price: {fmt_price(price)}"
+        f"💰 Price: {fmt_price(price)}\n\n"
+        f"{chart}"
     )
 
     await update.message.reply_text(msg, parse_mode="Markdown")
