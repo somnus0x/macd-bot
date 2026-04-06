@@ -17,7 +17,7 @@ Commands:
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, time
 from pathlib import Path
 
 import httpx
@@ -29,7 +29,11 @@ log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 WATCHLIST_FILE = os.environ.get("WATCHLIST_FILE", "/tmp/macd_watchlist.json")
+DAILY_FILE = os.environ.get("DAILY_FILE", "/tmp/macd_daily.json")
 MAX_WATCHES = 10
+DAILY_HOUR_UTC = int(os.environ.get("DAILY_HOUR_UTC", "2"))   # 02:00 UTC = 09:00 BKK
+DAILY_MINUTE_UTC = int(os.environ.get("DAILY_MINUTE_UTC", "0"))
+DAILY_COINS = ["BTC", "ETH", "SOL", "BNB", "XRP", "INIT"]
 
 BINANCE_ENDPOINTS = [
     "https://data-api.binance.vision/api/v3",
@@ -163,6 +167,21 @@ def load_watchlist() -> dict:
 
 def save_watchlist(wl: dict):
     Path(WATCHLIST_FILE).write_text(json.dumps(wl, indent=2))
+
+
+# === Daily config ===
+
+def load_daily_chats() -> list[int]:
+    if Path(DAILY_FILE).exists():
+        try:
+            return json.loads(Path(DAILY_FILE).read_text())
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return []
+
+
+def save_daily_chats(chats: list[int]):
+    Path(DAILY_FILE).write_text(json.dumps(chats))
 
 
 # === Format helpers ===
@@ -682,6 +701,112 @@ async def dom_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+# === /daily ===
+
+async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    args = context.args or []
+    chat_id = update.effective_chat.id
+    chats = load_daily_chats()
+
+    if not args:
+        status = "✅ ON" if chat_id in chats else "❌ OFF"
+        await update.message.reply_text(
+            f"📅 *Daily Snapshot* — {status}\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"  /daily on — enable\n"
+            f"  /daily off — disable\n"
+            f"  /daily now — send snapshot now\n\n"
+            f"Fires daily at 09:00 BKK",
+            parse_mode="Markdown",
+        )
+        return
+
+    action = args[0].lower()
+
+    if action == "on":
+        if chat_id not in chats:
+            chats.append(chat_id)
+            save_daily_chats(chats)
+        await update.message.reply_text("📅 Daily snapshot *enabled* for this chat.\n⏰ 09:00 BKK daily.", parse_mode="Markdown")
+
+    elif action == "off":
+        if chat_id in chats:
+            chats.remove(chat_id)
+            save_daily_chats(chats)
+        await update.message.reply_text("🔕 Daily snapshot *disabled*.", parse_mode="Markdown")
+
+    elif action == "now":
+        await send_daily_snapshot(context, chat_id)
+
+    else:
+        await update.message.reply_text("Usage: /daily on | off | now")
+
+
+async def send_daily_snapshot(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Build and send daily price snapshot for configured coins."""
+    lines = [
+        f"📅 *Daily Snapshot* — {datetime.utcnow().strftime('%b %d, %Y')}",
+        "━━━━━━━━━━━━━━━",
+    ]
+
+    for coin in DAILY_COINS:
+        pair = resolve_pair(coin)
+        try:
+            ticker = await fetch_ticker(pair)
+            if not ticker:
+                lines.append(f"\n❌ {coin} — unavailable")
+                continue
+
+            price = float(ticker["lastPrice"])
+            change = float(ticker["priceChangePercent"])
+            sign = "+" if change > 0 else ""
+            emoji = trend_emoji(change)
+
+            kline_data = await fetch_klines(pair)
+            closes = [float(c[4]) for c in kline_data] if kline_data else []
+            rsi = compute_rsi(closes) if len(closes) > 15 else None
+            rsi_str = f" | RSI `{rsi}`" if rsi else ""
+
+            lines.append(f"\n{emoji} *{coin}* — {fmt_price(price)} ({sign}{change:.1f}%){rsi_str}")
+
+            # Compact chart for top 3 (BTC, ETH, SOL)
+            if coin in ("BTC", "ETH", "SOL") and closes:
+                chart = ascii_chart(closes, width=20, height=5)
+                lines.append(chart)
+        except Exception as e:
+            log.error(f"Daily snapshot error for {coin}: {e}")
+            lines.append(f"\n❌ {coin} — error")
+
+    # Append FnG
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get("https://api.alternative.me/fco/fear-and-greed-index/")
+            fng_data = resp.json()["data"][0]
+            fng_val = int(fng_data["value"])
+            fng_label = fng_data["value_classification"]
+            lines.append(f"\n🌡️ Fear & Greed: *{fng_val}* — {fng_label}")
+    except Exception:
+        pass
+
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text="\n".join(lines),
+        parse_mode="Markdown",
+    )
+
+
+async def daily_cron(context: ContextTypes.DEFAULT_TYPE):
+    """Fires once daily, sends snapshot to all registered chats."""
+    chats = load_daily_chats()
+    for chat_id in chats:
+        try:
+            await send_daily_snapshot(context, chat_id)
+        except Exception as e:
+            log.error(f"Daily snapshot failed for {chat_id}: {e}")
+
+
 # === /start ===
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -699,6 +824,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🌡️ *Sentiment*\n"
         "  /fng — Fear & Greed index\n"
         "  /dom — BTC dominance\n\n"
+        "📅 *Daily*\n"
+        "  /daily on — enable daily snapshot\n"
+        "  /daily off — disable\n"
+        "  /daily now — send snapshot now\n\n"
         "👁️ *Alerts*\n"
         "  /macd watch `PAIR` — hourly MACD alerts\n"
         "  /macd stop `PAIR` — remove alerts\n"
@@ -747,6 +876,7 @@ async def post_init(application: Application):
         BotCommand("coins", "🪙 List supported coins"),
         BotCommand("fng", "😱 Fear & Greed index"),
         BotCommand("dom", "🏛️ BTC dominance"),
+        BotCommand("daily", "📅 Daily snapshot on/off"),
         BotCommand("start", "⚡ Show all commands"),
     ])
     log.info("Bot commands registered.")
@@ -768,11 +898,13 @@ def main():
     app.add_handler(CommandHandler("coins", coins_command))
     app.add_handler(CommandHandler("fng", fng_command))
     app.add_handler(CommandHandler("dom", dom_command))
+    app.add_handler(CommandHandler("daily", daily_command))
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(coin_picker_callback))
 
     job_queue = app.job_queue
     job_queue.run_repeating(hourly_check, interval=3600, first=10)
+    job_queue.run_daily(daily_cron, time=time(hour=DAILY_HOUR_UTC, minute=DAILY_MINUTE_UTC))
 
     log.info("⚡ Crypto Signal Bot starting...")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
