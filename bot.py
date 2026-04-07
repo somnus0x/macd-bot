@@ -175,6 +175,16 @@ def load_watchlist() -> dict:
             return data
         except (json.JSONDecodeError, ValueError):
             pass
+    # Fallback: env var for Railway (no persistent volume)
+    env_wl = os.environ.get("WATCHLIST_JSON", "")
+    if env_wl:
+        try:
+            data = json.loads(env_wl)
+            # Persist to file so subsequent loads are fast
+            Path(WATCHLIST_FILE).write_text(json.dumps(data, indent=2))
+            return data
+        except (json.JSONDecodeError, ValueError):
+            pass
     return {}
 
 
@@ -1048,6 +1058,25 @@ async def interval_check(context: ContextTypes.DEFAULT_TYPE):
         save_cross_state(cross_state)
 
 
+# === /export ===
+
+async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Dump current state as Railway env vars. Copy-paste into Railway dashboard."""
+    if not update.message:
+        return
+    wl = load_watchlist()
+    daily = load_daily_chats()
+    lines = ["🔧 *Railway Env Vars* — paste these to survive redeploys:\n"]
+    if daily:
+        lines.append(f"`DAILY_CHATS={','.join(str(c) for c in daily)}`")
+    if wl:
+        wl_json = json.dumps(wl, separators=(',', ':'))
+        lines.append(f"`WATCHLIST_JSON={wl_json}`")
+    if not daily and not wl:
+        lines.append("No state to export. Add watches or enable /daily first.")
+    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
+
+
 # === /status ===
 
 _start_time = datetime.utcnow()
@@ -1133,6 +1162,7 @@ def main():
     app.add_handler(CommandHandler("dom", dom_command))
     app.add_handler(CommandHandler("daily", daily_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(coin_picker_callback))
 
@@ -1140,7 +1170,13 @@ def main():
     job_queue.run_repeating(interval_check, interval=900, first=10)  # every 15 min
     job_queue.run_daily(daily_cron, time=time(hour=DAILY_HOUR_UTC, minute=DAILY_MINUTE_UTC))
 
-    log.info("⚡ Crypto Signal Bot starting...")
+    # Log startup state for debugging
+    wl = load_watchlist()
+    daily = load_daily_chats()
+    total_w = sum(len(v) for v in wl.values())
+    log.info(f"⚡ Crypto Signal Bot starting... data_dir={_DATA_DIR} watches={total_w} daily_chats={len(daily)}")
+    if total_w == 0 and not daily:
+        log.warning("⚠️ No watches or daily chats loaded. Set WATCHLIST_JSON and/or DAILY_CHATS env vars for persistence across deploys.")
     app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 
