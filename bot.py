@@ -3,15 +3,15 @@
 Runs on Railway (or any Python host). No API keys needed for market data.
 
 Commands:
-  /macd [PAIR]         — MACD(12,26,9) crossover check
-  /macd watch PAIR     — hourly crossover alerts
-  /macd stop PAIR      — remove alerts
-  /macd list           — show active watches
-  /price [PAIR]        — quick price + 24h change
-  /rsi [PAIR]          — RSI(14) overbought/oversold
-  /fng                 — Fear & Greed index
-  /dom                 — BTC dominance
-  /start               — show all commands
+  /macd [PAIR]                    — MACD(12,26,9) crossover check
+  /macd watch PAIR [INTERVAL]     — MACD alerts (default: 1h, options: 15m/30m/1h/4h/1d)
+  /macd stop PAIR [INTERVAL]      — remove alerts
+  /macd list                      — show active watches
+  /price [PAIR]                   — quick price + 24h change
+  /rsi [PAIR]                     — RSI(14) overbought/oversold
+  /fng                            — Fear & Greed index
+  /dom                            — BTC dominance
+  /start                          — show all commands
 """
 
 import os
@@ -28,12 +28,18 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s')
 log = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-WATCHLIST_FILE = os.environ.get("WATCHLIST_FILE", "/tmp/macd_watchlist.json")
-DAILY_FILE = os.environ.get("DAILY_FILE", "/tmp/macd_daily.json")
-MAX_WATCHES = 10
+# Persist state to /data/ if available (Railway volume), fallback to /tmp/
+_DATA_DIR = "/data" if os.path.isdir("/data") else "/tmp"
+WATCHLIST_FILE = os.environ.get("WATCHLIST_FILE", f"{_DATA_DIR}/macd_watchlist.json")
+DAILY_FILE = os.environ.get("DAILY_FILE", f"{_DATA_DIR}/macd_daily.json")
+MAX_WATCHES = 20
 DAILY_HOUR_UTC = int(os.environ.get("DAILY_HOUR_UTC", "2"))   # 02:00 UTC = 09:00 BKK
 DAILY_MINUTE_UTC = int(os.environ.get("DAILY_MINUTE_UTC", "0"))
 DAILY_COINS = ["BTC", "ETH", "SOL", "BNB", "XRP", "INIT"]
+
+VALID_INTERVALS = {"15m", "30m", "1h", "4h", "1d"}
+INTERVAL_LABELS = {"15m": "15-Min", "30m": "30-Min", "1h": "1-Hour", "4h": "4-Hour", "1d": "Daily"}
+INTERVAL_SECONDS = {"15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
 
 BINANCE_ENDPOINTS = [
     "https://data-api.binance.vision/api/v3",
@@ -155,11 +161,17 @@ async def fetch_ticker(pair: str) -> dict | None:
 
 
 # === Watchlist ===
+# Format: {chat_id: [{"pair": "BTCUSDT", "interval": "1h", "signal": "both"}]}
 
 def load_watchlist() -> dict:
     if Path(WATCHLIST_FILE).exists():
         try:
-            return json.loads(Path(WATCHLIST_FILE).read_text())
+            data = json.loads(Path(WATCHLIST_FILE).read_text())
+            # Migrate old format: [pair_str] → [{pair, interval, signal}]
+            for cid, entries in data.items():
+                if entries and isinstance(entries[0], str):
+                    data[cid] = [{"pair": p, "interval": "1h", "signal": "both"} for p in entries]
+            return data
         except (json.JSONDecodeError, ValueError):
             pass
     return {}
@@ -177,6 +189,10 @@ def load_daily_chats() -> list[int]:
             return json.loads(Path(DAILY_FILE).read_text())
         except (json.JSONDecodeError, ValueError):
             pass
+    # Fallback: env var for Railway (no persistent volume)
+    env_chats = os.environ.get("DAILY_CHATS", "")
+    if env_chats:
+        return [int(c.strip()) for c in env_chats.split(",") if c.strip()]
     return []
 
 
@@ -402,53 +418,89 @@ async def macd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # /macd list
     if args and args[0].lower() == "list":
         wl = load_watchlist()
-        pairs = wl.get(chat_id, [])
-        if not pairs:
-            await update.message.reply_text("📭 No active watches.\nUse /macd watch PAIR to add one.")
+        watches = wl.get(chat_id, [])
+        if not watches:
+            await update.message.reply_text("📭 No active watches.\nUse `/macd watch BTC 4h` to add one.", parse_mode="Markdown")
         else:
-            lines = "\n".join(f"  ⚡ {p}" for p in pairs)
-            await update.message.reply_text(f"👁️ Active watches ({len(pairs)}/{MAX_WATCHES}):\n{lines}")
+            lines = []
+            for w in watches:
+                sig = "↕️" if w["signal"] == "both" else ("🚀" if w["signal"] == "up" else "🔻")
+                lines.append(f"  {sig} `{w['pair']}` — {INTERVAL_LABELS.get(w['interval'], w['interval'])}")
+            await update.message.reply_text(
+                f"👁️ Active watches ({len(watches)}/{MAX_WATCHES}):\n" + "\n".join(lines) +
+                "\n\n↕️ = both | 🚀 = cross up only | 🔻 = cross down only",
+                parse_mode="Markdown",
+            )
         return
 
-    # /macd watch PAIR
+    # /macd watch PAIR [INTERVAL] [up|down|both]
     if args and args[0].lower() == "watch":
         if len(args) < 2:
-            await update.message.reply_text("Usage: /macd watch BTC")
+            await update.message.reply_text(
+                "Usage: `/macd watch BTC [15m|30m|1h|4h|1d] [up|down|both]`\n"
+                "Default: 1h, both signals",
+                parse_mode="Markdown",
+            )
             return
         pair = resolve_pair(args[1])
+        interval = "1h"
+        signal_filter = "both"
+        for a in args[2:]:
+            al = a.lower()
+            if al in VALID_INTERVALS:
+                interval = al
+            elif al in ("up", "down", "both"):
+                signal_filter = al
+
         wl = load_watchlist()
-        chat_pairs = wl.get(chat_id, [])
-        if pair in chat_pairs:
-            await update.message.reply_text(f"⚡ {pair} already watched.")
+        watches = wl.get(chat_id, [])
+        # Check for duplicate pair+interval combo
+        existing = [w for w in watches if w["pair"] == pair and w["interval"] == interval]
+        if existing:
+            # Update signal filter if different
+            existing[0]["signal"] = signal_filter
+            save_watchlist(wl)
+            await update.message.reply_text(f"⚡ Updated {pair} {INTERVAL_LABELS[interval]} → signal: {signal_filter}")
             return
-        if len(chat_pairs) >= MAX_WATCHES:
-            await update.message.reply_text(f"🚫 Max {MAX_WATCHES} watches. /macd stop PAIR to free a slot.")
+        if len(watches) >= MAX_WATCHES:
+            await update.message.reply_text(f"🚫 Max {MAX_WATCHES} watches. `/macd stop PAIR` to free a slot.", parse_mode="Markdown")
             return
-        data = await fetch_klines(pair)
+        data = await fetch_klines(pair, interval=interval)
         if not data:
             await update.message.reply_text(f"❌ Can't fetch {pair}. Try: BTC, ETH, SOL, etc.")
             return
-        chat_pairs.append(pair)
-        wl[chat_id] = chat_pairs
+        watches.append({"pair": pair, "interval": interval, "signal": signal_filter})
+        wl[chat_id] = watches
         save_watchlist(wl)
-        await update.message.reply_text(f"👁️ Now watching {pair} hourly.\n📊 {len(chat_pairs)}/{MAX_WATCHES} slots used.")
+        sig_str = "🚀 up" if signal_filter == "up" else ("🔻 down" if signal_filter == "down" else "↕️ both")
+        await update.message.reply_text(
+            f"👁️ Watching *{pair}* {INTERVAL_LABELS[interval]} ({sig_str})\n"
+            f"📊 {len(watches)}/{MAX_WATCHES} slots used.",
+            parse_mode="Markdown",
+        )
         return
 
-    # /macd stop PAIR
+    # /macd stop PAIR [INTERVAL]
     if args and args[0].lower() == "stop":
         if len(args) < 2:
-            await update.message.reply_text("Usage: /macd stop BTC")
+            await update.message.reply_text("Usage: `/macd stop BTC [1h]`\nOmit interval to stop all for that pair.", parse_mode="Markdown")
             return
         pair = resolve_pair(args[1])
+        interval = args[2].lower() if len(args) > 2 and args[2].lower() in VALID_INTERVALS else None
         wl = load_watchlist()
-        chat_pairs = wl.get(chat_id, [])
-        if pair not in chat_pairs:
+        watches = wl.get(chat_id, [])
+        before = len(watches)
+        if interval:
+            watches = [w for w in watches if not (w["pair"] == pair and w["interval"] == interval)]
+        else:
+            watches = [w for w in watches if w["pair"] != pair]
+        removed = before - len(watches)
+        if removed == 0:
             await update.message.reply_text(f"🤷 {pair} not in watchlist.")
             return
-        chat_pairs.remove(pair)
-        wl[chat_id] = chat_pairs
+        wl[chat_id] = watches
         save_watchlist(wl)
-        await update.message.reply_text(f"🔕 Stopped watching {pair}.\n📊 {len(chat_pairs)}/{MAX_WATCHES} slots used.")
+        await update.message.reply_text(f"🔕 Removed {removed} watch(es) for {pair}.\n📊 {len(watches)}/{MAX_WATCHES} slots used.")
         return
 
     # /macd (no pair) → show picker
@@ -798,13 +850,50 @@ async def send_daily_snapshot(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
 
 
 async def daily_cron(context: ContextTypes.DEFAULT_TYPE):
-    """Fires once daily, sends snapshot to all registered chats."""
+    """Fires once daily — send snapshots + check 1d MACD watches."""
+    # Daily snapshots
     chats = load_daily_chats()
     for chat_id in chats:
         try:
             await send_daily_snapshot(context, chat_id)
         except Exception as e:
             log.error(f"Daily snapshot failed for {chat_id}: {e}")
+
+    # 1d interval MACD watches
+    wl = load_watchlist()
+    for chat_id, watches in wl.items():
+        for watch in watches:
+            if watch["interval"] != "1d":
+                continue
+            pair = watch["pair"]
+            signal_filter = watch.get("signal", "both")
+            try:
+                data = await fetch_klines(pair, interval="1d", limit=100)
+                if not data:
+                    continue
+                closes = [float(c[4]) for c in data]
+                price = closes[-1]
+                result = compute_macd(closes)
+                if not result or not result["cross"]:
+                    continue
+                cross = result["cross"]
+                if signal_filter == "up" and cross != "BULLISH":
+                    continue
+                if signal_filter == "down" and cross != "BEARISH":
+                    continue
+                emoji = "🚀" if cross == "BULLISH" else "🔻"
+                msg = (
+                    f"{emoji} *{pair}* Daily MACD *{cross}* cross\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"📊 MACD: `{result['macd']}` | Signal: `{result['signal']}`\n"
+                    f"💰 Price: {fmt_price(price)}\n"
+                    f"🕐 Daily candle close"
+                )
+                await context.bot.send_message(
+                    chat_id=int(chat_id), text=msg, parse_mode="Markdown"
+                )
+            except Exception as e:
+                log.error(f"Daily MACD check error for {pair} in {chat_id}: {e}")
 
 
 # === /start ===
@@ -829,8 +918,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /daily off — disable\n"
         "  /daily now — send snapshot now\n\n"
         "👁️ *Alerts*\n"
-        "  /macd watch `PAIR` — hourly MACD alerts\n"
-        "  /macd stop `PAIR` — remove alerts\n"
+        "  /macd watch `PAIR` `[15m|30m|1h|4h|1d]` `[up|down]`\n"
+        "  /macd stop `PAIR` `[INTERVAL]`\n"
         "  /macd list — show watches\n\n"
         "Pairs: BTC, ETH, SOL, etc. or BTCUSDT\n"
         "No API keys. All data from Binance + CoinGecko.",
@@ -838,32 +927,74 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# === Hourly cron ===
+# === Interval-aware MACD watch cron ===
 
-async def hourly_check(context: ContextTypes.DEFAULT_TYPE):
+# Track which interval checks are due. Runs every 15 min, fires checks per interval.
+_check_counter = {"count": 0}  # 15m=every, 30m=every 2nd, 1h=every 4th, 4h=every 16th
+
+def intervals_due(count: int) -> set[str]:
+    """Return which intervals should be checked on this tick (every 15 min)."""
+    due = {"15m"}
+    if count % 2 == 0:
+        due.add("30m")
+    if count % 4 == 0:
+        due.add("1h")
+    if count % 16 == 0:
+        due.add("4h")
+    # 1d is handled separately by daily_cron
+    return due
+
+
+async def interval_check(context: ContextTypes.DEFAULT_TYPE):
+    """Runs every 15 min. Checks MACD crosses for watches whose interval is due."""
+    count = _check_counter["count"]
+    _check_counter["count"] = count + 1
+    due = intervals_due(count)
+
     wl = load_watchlist()
-    for chat_id, pairs in wl.items():
-        for pair in pairs:
+    for chat_id, watches in wl.items():
+        for watch in watches:
+            if watch["interval"] not in due:
+                continue
+            if watch["interval"] == "1d":
+                continue  # daily handled separately
+
+            pair = watch["pair"]
+            interval = watch["interval"]
+            signal_filter = watch.get("signal", "both")
+
             try:
-                data = await fetch_klines(pair)
+                data = await fetch_klines(pair, interval=interval)
                 if not data:
                     continue
                 closes = [float(c[4]) for c in data]
                 price = closes[-1]
                 result = compute_macd(closes)
-                if result and result["cross"]:
-                    emoji = "🟢" if result["cross"] == "BULLISH" else "🔴"
-                    msg = (
-                        f"{emoji} *{pair}* 1h MACD *{result['cross']}* cross\n"
-                        f"━━━━━━━━━━━━━━━\n"
-                        f"📊 MACD: `{result['macd']}` | Signal: `{result['signal']}`\n"
-                        f"💰 Price: {fmt_price(price)}"
-                    )
-                    await context.bot.send_message(
-                        chat_id=int(chat_id), text=msg, parse_mode="Markdown"
-                    )
+                if not result or not result["cross"]:
+                    continue
+
+                # Apply signal filter
+                cross = result["cross"]
+                if signal_filter == "up" and cross != "BULLISH":
+                    continue
+                if signal_filter == "down" and cross != "BEARISH":
+                    continue
+
+                emoji = "🚀" if cross == "BULLISH" else "🔻"
+                label = INTERVAL_LABELS.get(interval, interval)
+                now = datetime.utcnow().strftime("%H:%M UTC")
+                msg = (
+                    f"{emoji} *{pair}* {label} MACD *{cross}* cross\n"
+                    f"━━━━━━━━━━━━━━━\n"
+                    f"📊 MACD: `{result['macd']}` | Signal: `{result['signal']}`\n"
+                    f"💰 Price: {fmt_price(price)}\n"
+                    f"🕐 {now}"
+                )
+                await context.bot.send_message(
+                    chat_id=int(chat_id), text=msg, parse_mode="Markdown"
+                )
             except Exception as e:
-                log.error(f"Error checking {pair} for {chat_id}: {e}")
+                log.error(f"Error checking {pair} {interval} for {chat_id}: {e}")
 
 
 # === Post-init ===
@@ -903,7 +1034,7 @@ def main():
     app.add_handler(CallbackQueryHandler(coin_picker_callback))
 
     job_queue = app.job_queue
-    job_queue.run_repeating(hourly_check, interval=3600, first=10)
+    job_queue.run_repeating(interval_check, interval=900, first=10)  # every 15 min
     job_queue.run_daily(daily_cron, time=time(hour=DAILY_HOUR_UTC, minute=DAILY_MINUTE_UTC))
 
     log.info("⚡ Crypto Signal Bot starting...")
