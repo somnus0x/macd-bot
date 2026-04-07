@@ -32,6 +32,7 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 _DATA_DIR = "/data" if os.path.isdir("/data") else "/tmp"
 WATCHLIST_FILE = os.environ.get("WATCHLIST_FILE", f"{_DATA_DIR}/macd_watchlist.json")
 DAILY_FILE = os.environ.get("DAILY_FILE", f"{_DATA_DIR}/macd_daily.json")
+CROSS_STATE_FILE = f"{_DATA_DIR}/macd_cross_state.json"
 MAX_WATCHES = 20
 DAILY_HOUR_UTC = int(os.environ.get("DAILY_HOUR_UTC", "2"))   # 02:00 UTC = 09:00 BKK
 DAILY_MINUTE_UTC = int(os.environ.get("DAILY_MINUTE_UTC", "0"))
@@ -179,6 +180,22 @@ def load_watchlist() -> dict:
 
 def save_watchlist(wl: dict):
     Path(WATCHLIST_FILE).write_text(json.dumps(wl, indent=2))
+
+
+# === Cross state tracking (dedup alerts) ===
+# Format: {"chat_id:pair:interval": "BULLISH"|"BEARISH"|null}
+
+def load_cross_state() -> dict:
+    if Path(CROSS_STATE_FILE).exists():
+        try:
+            return json.loads(Path(CROSS_STATE_FILE).read_text())
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {}
+
+
+def save_cross_state(state: dict):
+    Path(CROSS_STATE_FILE).write_text(json.dumps(state))
 
 
 # === Daily config ===
@@ -859,14 +876,17 @@ async def daily_cron(context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             log.error(f"Daily snapshot failed for {chat_id}: {e}")
 
-    # 1d interval MACD watches
+    # 1d interval MACD watches (with dedup)
     wl = load_watchlist()
+    cross_state = load_cross_state()
+    state_changed = False
     for chat_id, watches in wl.items():
         for watch in watches:
             if watch["interval"] != "1d":
                 continue
             pair = watch["pair"]
             signal_filter = watch.get("signal", "both")
+            state_key = f"{chat_id}:{pair}:1d"
             try:
                 data = await fetch_klines(pair, interval="1d", limit=100)
                 if not data:
@@ -874,9 +894,15 @@ async def daily_cron(context: ContextTypes.DEFAULT_TYPE):
                 closes = [float(c[4]) for c in data]
                 price = closes[-1]
                 result = compute_macd(closes)
-                if not result or not result["cross"]:
+                if not result:
                     continue
-                cross = result["cross"]
+                cross = result.get("cross")
+                prev_cross = cross_state.get(state_key)
+                if cross != prev_cross:
+                    cross_state[state_key] = cross
+                    state_changed = True
+                if not cross or cross == prev_cross:
+                    continue
                 if signal_filter == "up" and cross != "BULLISH":
                     continue
                 if signal_filter == "down" and cross != "BEARISH":
@@ -894,6 +920,8 @@ async def daily_cron(context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception as e:
                 log.error(f"Daily MACD check error for {pair} in {chat_id}: {e}")
+    if state_changed:
+        save_cross_state(cross_state)
 
 
 # === /start ===
@@ -921,6 +949,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /macd watch `PAIR` `[15m|30m|1h|4h|1d]` `[up|down]`\n"
         "  /macd stop `PAIR` `[INTERVAL]`\n"
         "  /macd list — show watches\n\n"
+        "🔧 *Status*\n"
+        "  /status — bot health + jobs\n\n"
         "Pairs: BTC, ETH, SOL, etc. or BTCUSDT\n"
         "No API keys. All data from Binance + CoinGecko.",
         parse_mode="Markdown"
@@ -946,12 +976,16 @@ def intervals_due(count: int) -> set[str]:
 
 
 async def interval_check(context: ContextTypes.DEFAULT_TYPE):
-    """Runs every 15 min. Checks MACD crosses for watches whose interval is due."""
+    """Runs every 15 min. Checks MACD crosses for watches whose interval is due.
+    Only alerts when cross STATE CHANGES — prevents spam on persistent crosses."""
     count = _check_counter["count"]
     _check_counter["count"] = count + 1
     due = intervals_due(count)
 
     wl = load_watchlist()
+    cross_state = load_cross_state()
+    state_changed = False
+
     for chat_id, watches in wl.items():
         for watch in watches:
             if watch["interval"] not in due:
@@ -962,6 +996,7 @@ async def interval_check(context: ContextTypes.DEFAULT_TYPE):
             pair = watch["pair"]
             interval = watch["interval"]
             signal_filter = watch.get("signal", "both")
+            state_key = f"{chat_id}:{pair}:{interval}"
 
             try:
                 data = await fetch_klines(pair, interval=interval)
@@ -970,11 +1005,24 @@ async def interval_check(context: ContextTypes.DEFAULT_TYPE):
                 closes = [float(c[4]) for c in data]
                 price = closes[-1]
                 result = compute_macd(closes)
-                if not result or not result["cross"]:
+                if not result:
                     continue
 
+                cross = result.get("cross")
+                prev_cross = cross_state.get(state_key)
+
+                # Update state regardless
+                if cross != prev_cross:
+                    cross_state[state_key] = cross
+                    state_changed = True
+
+                # Only alert on NEW crosses (state change from non-cross or opposite)
+                if not cross:
+                    continue
+                if cross == prev_cross:
+                    continue  # already alerted for this cross
+
                 # Apply signal filter
-                cross = result["cross"]
                 if signal_filter == "up" and cross != "BULLISH":
                     continue
                 if signal_filter == "down" and cross != "BEARISH":
@@ -996,6 +1044,59 @@ async def interval_check(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 log.error(f"Error checking {pair} {interval} for {chat_id}: {e}")
 
+    if state_changed:
+        save_cross_state(cross_state)
+
+
+# === /status ===
+
+_start_time = datetime.utcnow()
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show bot health: uptime, job state, watch count, last check."""
+    if not update.message:
+        return
+
+    uptime = datetime.utcnow() - _start_time
+    hours = int(uptime.total_seconds() // 3600)
+    minutes = int((uptime.total_seconds() % 3600) // 60)
+
+    wl = load_watchlist()
+    total_watches = sum(len(w) for w in wl.values())
+    total_chats = len(wl)
+
+    daily_chats = load_daily_chats()
+    count = _check_counter["count"]
+    due = intervals_due(count)
+
+    cross_state = load_cross_state()
+    active_crosses = sum(1 for v in cross_state.values() if v is not None)
+
+    # Job queue info
+    jobs = context.job_queue.jobs()
+    job_lines = []
+    for job in jobs:
+        next_run = job.next_t
+        if next_run:
+            next_str = next_run.strftime("%H:%M UTC")
+        else:
+            next_str = "—"
+        job_lines.append(f"  `{job.name}` → next: {next_str}")
+
+    msg = (
+        f"⚡ *Bot Status*\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"⏱️ Uptime: {hours}h {minutes}m\n"
+        f"🔄 Check cycle: #{count}\n"
+        f"📡 Intervals due next: {', '.join(sorted(due))}\n"
+        f"👁️ Watches: {total_watches} across {total_chats} chats\n"
+        f"📅 Daily chats: {len(daily_chats)}\n"
+        f"⚡ Active crosses tracked: {active_crosses}\n"
+        f"📂 Data dir: `{_DATA_DIR}`\n"
+        f"\n🔧 *Jobs:*\n" + ("\n".join(job_lines) if job_lines else "  none")
+    )
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
 
 # === Post-init ===
 
@@ -1008,6 +1109,7 @@ async def post_init(application: Application):
         BotCommand("fng", "😱 Fear & Greed index"),
         BotCommand("dom", "🏛️ BTC dominance"),
         BotCommand("daily", "📅 Daily snapshot on/off"),
+        BotCommand("status", "🔧 Bot health + job status"),
         BotCommand("start", "⚡ Show all commands"),
     ])
     log.info("Bot commands registered.")
@@ -1030,6 +1132,7 @@ def main():
     app.add_handler(CommandHandler("fng", fng_command))
     app.add_handler(CommandHandler("dom", dom_command))
     app.add_handler(CommandHandler("daily", daily_command))
+    app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(coin_picker_callback))
 
