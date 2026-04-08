@@ -133,6 +133,137 @@ def compute_rsi(closes: list[float], period: int = 14) -> float | None:
     return round(100 - (100 / (1 + rs)), 2)
 
 
+def compute_ema_trend(closes: list[float]) -> dict | None:
+    """EMA20/50 trend: price position relative to moving averages."""
+    if len(closes) < 50:
+        return None
+    ema20 = ema(closes, 20)
+    ema50 = ema(closes, 50)
+    if not ema20 or not ema50:
+        return None
+    price = closes[-1]
+    e20 = ema20[-1]
+    e50 = ema50[-1]
+    return {
+        "ema20": round(e20, 4),
+        "ema50": round(e50, 4),
+        "above_ema20": price > e20,
+        "above_ema50": price > e50,
+        "ema20_above_ema50": e20 > e50,  # golden cross structure
+    }
+
+
+def compute_volume_trend(klines: list) -> dict | None:
+    """Compare recent volume to average — rising volume confirms moves."""
+    if len(klines) < 20:
+        return None
+    volumes = [float(k[5]) for k in klines]
+    avg_vol = sum(volumes[-20:]) / 20
+    recent_vol = sum(volumes[-3:]) / 3
+    if avg_vol == 0:
+        return None
+    ratio = round(recent_vol / avg_vol, 2)
+    return {
+        "avg_20": round(avg_vol, 2),
+        "recent_3": round(recent_vol, 2),
+        "ratio": ratio,
+        "rising": ratio > 1.2,
+    }
+
+
+def composite_signal(closes: list[float], klines: list) -> dict:
+    """TrueNorth-style multi-indicator composite verdict.
+    Score: -100 (STRONG_SELL) to +100 (STRONG_BUY)."""
+    score = 0
+    signals = []
+
+    # MACD (weight: 30)
+    macd = compute_macd(closes)
+    if macd:
+        if macd["cross"] == "BULLISH":
+            score += 30; signals.append("MACD bullish cross")
+        elif macd["cross"] == "BEARISH":
+            score -= 30; signals.append("MACD bearish cross")
+        elif macd["histogram"] > 0:
+            score += 10; signals.append("MACD above signal")
+        else:
+            score -= 10; signals.append("MACD below signal")
+
+    # RSI (weight: 25)
+    rsi = compute_rsi(closes)
+    if rsi is not None:
+        if rsi >= 70:
+            score -= 25; signals.append(f"RSI overbought ({rsi})")
+        elif rsi >= 60:
+            score -= 5; signals.append(f"RSI warm ({rsi})")
+        elif rsi <= 30:
+            score += 25; signals.append(f"RSI oversold ({rsi})")
+        elif rsi <= 40:
+            score += 5; signals.append(f"RSI cool ({rsi})")
+        else:
+            signals.append(f"RSI neutral ({rsi})")
+
+    # EMA trend (weight: 25)
+    ema_t = compute_ema_trend(closes)
+    if ema_t:
+        if ema_t["above_ema20"] and ema_t["above_ema50"]:
+            score += 20; signals.append("Price > EMA20 > EMA50")
+        elif ema_t["above_ema20"]:
+            score += 10; signals.append("Price > EMA20, below EMA50")
+        elif not ema_t["above_ema20"] and not ema_t["above_ema50"]:
+            score -= 20; signals.append("Price < EMA20 < EMA50")
+        else:
+            score -= 10; signals.append("Price < EMA20, above EMA50")
+        if ema_t["ema20_above_ema50"]:
+            score += 5; signals.append("EMA20 > EMA50 (golden)")
+        else:
+            score -= 5; signals.append("EMA20 < EMA50 (death)")
+
+    # Volume confirmation (weight: 20)
+    vol = compute_volume_trend(klines)
+    if vol:
+        if vol["rising"] and score > 0:
+            score += 20; signals.append(f"Volume confirms ({vol['ratio']}x avg)")
+        elif vol["rising"] and score < 0:
+            score -= 20; signals.append(f"Volume confirms sell ({vol['ratio']}x avg)")
+        elif vol["rising"]:
+            signals.append(f"Volume spike ({vol['ratio']}x avg)")
+        else:
+            signals.append(f"Volume normal ({vol['ratio']}x avg)")
+
+    # Clamp and classify
+    score = max(-100, min(100, score))
+    if score >= 60:
+        verdict = "STRONG_BUY"
+    elif score >= 25:
+        verdict = "BUY"
+    elif score > -25:
+        verdict = "NEUTRAL"
+    elif score > -60:
+        verdict = "SELL"
+    else:
+        verdict = "STRONG_SELL"
+
+    return {
+        "score": score,
+        "verdict": verdict,
+        "signals": signals,
+        "macd": macd,
+        "rsi": rsi,
+        "ema": ema_t,
+        "volume": vol,
+    }
+
+
+VERDICT_EMOJI = {
+    "STRONG_BUY": "🟢🟢",
+    "BUY": "🟢",
+    "NEUTRAL": "⚪",
+    "SELL": "🔴",
+    "STRONG_SELL": "🔴🔴",
+}
+
+
 # === Binance API ===
 
 async def binance_get(path: str, params: dict) -> dict | list | None:
@@ -331,7 +462,7 @@ async def coin_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     parts = query.data.split(":", 1)
-    if len(parts) != 2 or parts[0] not in ("macd", "rsi", "price"):
+    if len(parts) != 2 or parts[0] not in ("macd", "rsi", "price", "scan"):
         return
 
     cmd, coin = parts
@@ -429,6 +560,30 @@ async def coin_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             f"📈 24h High: {fmt_price(high)}\n"
             f"📉 24h Low: {fmt_price(low)}\n"
             f"📊 24h Volume: {vol_str}\n\n"
+            f"{chart}"
+        )
+        await query.message.reply_text(msg, parse_mode="Markdown")
+
+    elif cmd == "scan":
+        data = await fetch_klines(pair, interval="1h", limit=100)
+        if not data:
+            await query.message.reply_text(f"❌ Can't fetch {pair}.")
+            return
+        closes = [float(c[4]) for c in data]
+        price = closes[-1]
+        chart = ascii_chart(closes)
+        cs = composite_signal(closes, data)
+        v_emoji = VERDICT_EMOJI.get(cs["verdict"], "⚪")
+        sig_lines = "\n".join(f"  • {s}" for s in cs["signals"][:6])
+        bar_pos = int((cs["score"] + 100) / 10)
+        bar = "░" * bar_pos + "█" + "░" * (20 - bar_pos)
+        msg = (
+            f"{v_emoji} *{pair}* — *{cs['verdict']}*\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"📊 Score: *{cs['score']}* / 100\n"
+            f"`SELL [{bar}] BUY`\n"
+            f"💰 Price: {fmt_price(price)}\n\n"
+            f"*Signals:*\n{sig_lines}\n\n"
             f"{chart}"
         )
         await query.message.reply_text(msg, parse_mode="Markdown")
@@ -709,6 +864,94 @@ async def rsi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+# === /scan ===
+
+SCAN_COINS = ["BTC", "ETH", "SOL", "BNB", "XRP", "AVAX", "ATOM", "LINK", "SUI", "INIT"]
+
+async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Single coin deep scan or full market scan."""
+    if not update.message:
+        return
+    args = context.args or []
+
+    # /scan (no args) → show picker
+    if not args:
+        await update.message.reply_text(
+            "🔍 *Scan* — pick a coin or use `/scan all`:",
+            parse_mode="Markdown",
+            reply_markup=coin_picker_keyboard("scan"),
+        )
+        return
+
+    if args[0].lower() != "all":
+        # Single coin deep scan
+        pair = resolve_pair(args[0])
+        data = await fetch_klines(pair, interval="1h", limit=100)
+        if not data:
+            await update.message.reply_text(f"❌ Can't fetch {pair}.")
+            return
+        closes = [float(c[4]) for c in data]
+        price = closes[-1]
+        chart = ascii_chart(closes)
+        cs = composite_signal(closes, data)
+        v_emoji = VERDICT_EMOJI.get(cs["verdict"], "⚪")
+
+        # Build signal breakdown
+        sig_lines = "\n".join(f"  • {s}" for s in cs["signals"][:6])
+
+        # Score bar
+        bar_pos = int((cs["score"] + 100) / 10)
+        bar = "░" * bar_pos + "█" + "░" * (20 - bar_pos)
+
+        msg = (
+            f"{v_emoji} *{pair}* — *{cs['verdict']}*\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"📊 Score: *{cs['score']}* / 100\n"
+            f"`SELL [{bar}] BUY`\n"
+            f"💰 Price: {fmt_price(price)}\n\n"
+            f"*Signals:*\n{sig_lines}\n\n"
+            f"{chart}"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    # Market scan — all coins
+    await update.message.reply_text("🔍 Scanning market...")
+    results = []
+    for coin in SCAN_COINS:
+        pair = resolve_pair(coin)
+        try:
+            data = await fetch_klines(pair, interval="1h", limit=100)
+            if not data:
+                continue
+            closes = [float(c[4]) for c in data]
+            ticker = await fetch_ticker(pair)
+            change = float(ticker["priceChangePercent"]) if ticker else 0
+            cs = composite_signal(closes, data)
+            results.append((coin, cs["score"], cs["verdict"], change))
+        except Exception:
+            continue
+
+    # Sort by score descending
+    results.sort(key=lambda x: x[1], reverse=True)
+
+    lines = [
+        "🔍 *Market Scan* — TrueNorth Style",
+        "━━━━━━━━━━━━━━━",
+    ]
+    for coin, score, verdict, change in results:
+        v_emoji = VERDICT_EMOJI.get(verdict, "⚪")
+        sign = "+" if change > 0 else ""
+        lines.append(f"{v_emoji} `{coin:5s}` *{verdict:11s}* {score:+4d} ({sign}{change:.1f}%)")
+
+    # Summary
+    buys = sum(1 for _, _, v, _ in results if v in ("STRONG_BUY", "BUY"))
+    sells = sum(1 for _, _, v, _ in results if v in ("STRONG_SELL", "SELL"))
+    lines.append(f"\n📊 {buys} bullish · {sells} bearish · {len(results) - buys - sells} neutral")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 # === /fng ===
 
 async def fng_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -959,6 +1202,9 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  /macd watch `PAIR` `[15m|30m|1h|4h|1d]` `[up|down]`\n"
         "  /macd stop `PAIR` `[INTERVAL]`\n"
         "  /macd list — show watches\n\n"
+        "🔍 *Scan*\n"
+        "  /scan `[PAIR]` — multi-indicator verdict\n"
+        "  /scan all — full market scan\n\n"
         "🔧 *Status*\n"
         "  /status — bot health + jobs\n\n"
         "Pairs: BTC, ETH, SOL, etc. or BTCUSDT\n"
@@ -1135,6 +1381,7 @@ async def post_init(application: Application):
         BotCommand("price", "💰 Price + 24h change"),
         BotCommand("rsi", "📉 RSI overbought/oversold"),
         BotCommand("coins", "🪙 List supported coins"),
+        BotCommand("scan", "🔍 Multi-indicator signal scan"),
         BotCommand("fng", "😱 Fear & Greed index"),
         BotCommand("dom", "🏛️ BTC dominance"),
         BotCommand("daily", "📅 Daily snapshot on/off"),
@@ -1158,6 +1405,7 @@ def main():
     app.add_handler(CommandHandler("price", price_command))
     app.add_handler(CommandHandler("rsi", rsi_command))
     app.add_handler(CommandHandler("coins", coins_command))
+    app.add_handler(CommandHandler("scan", scan_command))
     app.add_handler(CommandHandler("fng", fng_command))
     app.add_handler(CommandHandler("dom", dom_command))
     app.add_handler(CommandHandler("daily", daily_command))
