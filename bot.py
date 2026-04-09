@@ -280,12 +280,18 @@ async def binance_get(path: str, params: dict) -> dict | list | None:
     return None
 
 
-async def fetch_klines(pair: str, interval: str = "1h", limit: int = 100) -> list | None:
-    return await binance_get("klines", {
+async def fetch_klines(pair: str, interval: str = "1h", limit: int = 100, drop_open: bool = False) -> list | None:
+    """Fetch klines from Binance. If drop_open=True, fetch one extra and discard
+    the last (still-forming) candle so MACD/RSI only use closed data."""
+    fetch_limit = limit + 1 if drop_open else limit
+    data = await binance_get("klines", {
         "symbol": pair.upper(),
         "interval": interval,
-        "limit": limit,
+        "limit": fetch_limit,
     })
+    if data and drop_open:
+        return data[:-1]  # drop the in-progress candle
+    return data
 
 
 async def fetch_ticker(pair: str) -> dict | None:
@@ -1141,7 +1147,7 @@ async def daily_cron(context: ContextTypes.DEFAULT_TYPE):
             signal_filter = watch.get("signal", "both")
             state_key = f"{chat_id}:{pair}:1d"
             try:
-                data = await fetch_klines(pair, interval="1d", limit=100)
+                data = await fetch_klines(pair, interval="1d", limit=100, drop_open=True)
                 if not data:
                     continue
                 closes = [float(c[4]) for c in data]
@@ -1255,7 +1261,7 @@ async def interval_check(context: ContextTypes.DEFAULT_TYPE):
             state_key = f"{chat_id}:{pair}:{interval}"
 
             try:
-                data = await fetch_klines(pair, interval=interval)
+                data = await fetch_klines(pair, interval=interval, drop_open=True)
                 if not data:
                     continue
                 closes = [float(c[4]) for c in data]
@@ -1307,19 +1313,24 @@ async def interval_check(context: ContextTypes.DEFAULT_TYPE):
 # === /export ===
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Dump current state as Railway env vars. Copy-paste into Railway dashboard."""
+    """Dump THIS CHAT's state as Railway env vars. Scoped to invoking chat only."""
     if not update.message:
         return
+    chat_id = str(update.effective_chat.id)
+    chat_id_int = update.effective_chat.id
     wl = load_watchlist()
     daily = load_daily_chats()
-    lines = ["🔧 *Railway Env Vars* — paste these to survive redeploys:\n"]
-    if daily:
-        lines.append(f"`DAILY_CHATS={','.join(str(c) for c in daily)}`")
-    if wl:
-        wl_json = json.dumps(wl, separators=(',', ':'))
+    # Scope to this chat only
+    chat_watches = {chat_id: wl[chat_id]} if chat_id in wl else {}
+    chat_daily = [chat_id_int] if chat_id_int in daily else []
+    lines = ["🔧 *Railway Env Vars* (this chat only):\n"]
+    if chat_daily:
+        lines.append(f"`DAILY_CHATS={chat_id_int}`")
+    if chat_watches:
+        wl_json = json.dumps(chat_watches, separators=(',', ':'))
         lines.append(f"`WATCHLIST_JSON={wl_json}`")
-    if not daily and not wl:
-        lines.append("No state to export. Add watches or enable /daily first.")
+    if not chat_daily and not chat_watches:
+        lines.append("No state to export for this chat. Add watches or enable /daily first.")
     await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown")
 
 
