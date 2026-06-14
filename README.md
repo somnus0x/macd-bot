@@ -9,6 +9,7 @@ Telegram bot that detects MACD(12,26,9) crossovers on 1h candles from Binance.
 - `/macd watch BTCUSDT` — add to hourly alerts
 - `/macd stop BTCUSDT` — remove from alerts
 - `/macd list` — show active watches
+- `/bb BTCUSDT` — Bollinger Bands position
 
 ## Deploy to Railway
 

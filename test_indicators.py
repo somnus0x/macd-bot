@@ -4,7 +4,14 @@ import pytest
 
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 
-from bot import compute_ema_trend, compute_macd, compute_rsi, composite_signal, ema
+from bot import (
+    compute_bollinger_bands,
+    compute_ema_trend,
+    compute_macd,
+    compute_rsi,
+    composite_signal,
+    ema,
+)
 
 
 def flat_klines(count, volume=100.0):
@@ -68,6 +75,49 @@ def test_compute_rsi_returns_none_for_insufficient_closes():
     assert compute_rsi([1.0] * 14) is None
 
 
+def test_compute_bollinger_bands_known_input_known_output():
+    bands = compute_bollinger_bands([float(i) for i in range(1, 21)])
+
+    assert bands == {
+        "upper": 22.0326,
+        "middle": 10.5,
+        "lower": -1.0326,
+        "width_pct": 219.67,
+        "percent_b": 0.9119,
+        "zone": "NEAR_UPPER",
+    }
+
+
+def test_compute_bollinger_bands_flat_closes_returns_middle_position():
+    bands = compute_bollinger_bands([10.0] * 20)
+
+    assert bands == {
+        "upper": 10.0,
+        "middle": 10.0,
+        "lower": 10.0,
+        "width_pct": 0.0,
+        "percent_b": 0.5,
+        "zone": "MIDDLE",
+    }
+
+
+def test_compute_bollinger_bands_detects_price_below_lower_band():
+    bands = compute_bollinger_bands([10.0] * 19 + [0.0])
+
+    assert bands == {
+        "upper": 13.8589,
+        "middle": 9.5,
+        "lower": 5.1411,
+        "width_pct": 91.77,
+        "percent_b": -0.5897,
+        "zone": "BELOW_LOWER",
+    }
+
+
+def test_compute_bollinger_bands_returns_none_for_insufficient_closes():
+    assert compute_bollinger_bands([1.0] * 19) is None
+
+
 def test_compute_ema_trend_shape_and_values_for_rising_closes():
     trend = compute_ema_trend([float(i) for i in range(1, 61)])
 
@@ -100,6 +150,7 @@ def test_composite_signal_shape_and_nested_indicator_outputs():
         "macd",
         "rsi",
         "ema",
+        "bollinger",
         "volume",
     }
     assert result["score"] == -10
@@ -108,4 +159,5 @@ def test_composite_signal_shape_and_nested_indicator_outputs():
     assert result["macd"]["macd"] == pytest.approx(7.0)
     assert result["rsi"] == pytest.approx(100.0)
     assert result["ema"]["ema20"] == pytest.approx(50.5)
+    assert result["bollinger"]["zone"] == "NEAR_UPPER"
     assert result["volume"]["ratio"] == pytest.approx(1.0)

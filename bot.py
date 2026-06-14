@@ -9,6 +9,7 @@ Commands:
   /macd list                      — show active watches
   /price [PAIR]                   — quick price + 24h change
   /rsi [PAIR]                     — RSI(14) overbought/oversold
+  /bb [PAIR]                      — Bollinger Bands(20,2) position
   /fng                            — Fear & Greed index
   /dom                            — BTC dominance
   /portfolio COIN PRICE           — add paper trade position
@@ -137,6 +138,47 @@ def compute_rsi(closes: list[float], period: int = 14) -> float | None:
     return round(100 - (100 / (1 + rs)), 2)
 
 
+def compute_bollinger_bands(
+    closes: list[float],
+    period: int = 20,
+    multiplier: float = 2.0,
+) -> dict | None:
+    if len(closes) < period:
+        return None
+
+    window = closes[-period:]
+    price = closes[-1]
+    middle = sum(window) / period
+    variance = sum((value - middle) ** 2 for value in window) / period
+    std_dev = variance ** 0.5
+    upper = middle + multiplier * std_dev
+    lower = middle - multiplier * std_dev
+    band_range = upper - lower
+
+    percent_b = 0.5 if band_range == 0 else (price - lower) / band_range
+    width_pct = None if middle == 0 else (band_range / middle) * 100
+
+    if price > upper:
+        zone = "ABOVE_UPPER"
+    elif price < lower:
+        zone = "BELOW_LOWER"
+    elif percent_b >= 0.8:
+        zone = "NEAR_UPPER"
+    elif percent_b <= 0.2:
+        zone = "NEAR_LOWER"
+    else:
+        zone = "MIDDLE"
+
+    return {
+        "upper": round(upper, 4),
+        "middle": round(middle, 4),
+        "lower": round(lower, 4),
+        "width_pct": round(width_pct, 2) if width_pct is not None else None,
+        "percent_b": round(percent_b, 4),
+        "zone": zone,
+    }
+
+
 def compute_ema_trend(closes: list[float]) -> dict | None:
     """EMA20/50 trend: price position relative to moving averages."""
     if len(closes) < 50:
@@ -223,6 +265,20 @@ def composite_signal(closes: list[float], klines: list) -> dict:
         else:
             score -= 5; signals.append("EMA20 < EMA50 (death)")
 
+    # Bollinger Bands (context only)
+    bb = compute_bollinger_bands(closes)
+    if bb:
+        if bb["zone"] == "ABOVE_UPPER":
+            signals.append("BB above upper band")
+        elif bb["zone"] == "BELOW_LOWER":
+            signals.append("BB below lower band")
+        elif bb["zone"] == "NEAR_UPPER":
+            signals.append("BB near upper band")
+        elif bb["zone"] == "NEAR_LOWER":
+            signals.append("BB near lower band")
+        else:
+            signals.append("BB middle range")
+
     # Volume confirmation (weight: 20)
     vol = compute_volume_trend(klines)
     if vol:
@@ -255,6 +311,7 @@ def composite_signal(closes: list[float], klines: list) -> dict:
         "macd": macd,
         "rsi": rsi,
         "ema": ema_t,
+        "bollinger": bb,
         "volume": vol,
     }
 
@@ -460,6 +517,22 @@ def trend_emoji(change: float) -> str:
         return "💀"
 
 
+def bollinger_zone_label(zone: str) -> str:
+    labels = {
+        "ABOVE_UPPER": "🔴 above upper",
+        "NEAR_UPPER": "🟡 near upper",
+        "MIDDLE": "⚪ middle range",
+        "NEAR_LOWER": "🟡 near lower",
+        "BELOW_LOWER": "🟢 below lower",
+    }
+    return labels.get(zone, zone.lower().replace("_", " "))
+
+
+def bollinger_bar(percent_b: float, width: int = 20) -> str:
+    pos = max(0, min(width, round(percent_b * width)))
+    return "░" * pos + "█" + "░" * (width - pos)
+
+
 # === Inline coin picker ===
 
 PICKER_COINS = [
@@ -488,7 +561,7 @@ async def coin_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     parts = query.data.split(":", 1)
-    if len(parts) != 2 or parts[0] not in ("macd", "rsi", "price", "scan"):
+    if len(parts) != 2 or parts[0] not in ("macd", "rsi", "bb", "price", "scan"):
         return
 
     cmd, coin = parts
@@ -558,6 +631,34 @@ async def coin_picker_callback(update: Update, context: ContextTypes.DEFAULT_TYP
             f"━━━━━━━━━━━━━━━\n"
             f"RSI: *{rsi}* — {zone}\n"
             f"`[{bar}]`\n"
+            f"💰 Price: {fmt_price(price)}\n\n"
+            f"{chart}"
+        )
+        await query.message.reply_text(msg, parse_mode="Markdown")
+
+    elif cmd == "bb":
+        data = await fetch_klines(pair, interval="1h", limit=100)
+        if not data:
+            await query.message.reply_text(f"❌ Can't fetch {pair}.")
+            return
+        closes = [float(c[4]) for c in data]
+        price = closes[-1]
+        chart = ascii_chart(closes)
+        bb = compute_bollinger_bands(closes)
+        if bb is None:
+            await query.message.reply_text(f"❌ Not enough data for {pair}.")
+            return
+        zone = bollinger_zone_label(bb["zone"])
+        bar = bollinger_bar(bb["percent_b"])
+        msg = (
+            f"〰️ *{pair}* Bollinger Bands(20,2) 1h\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"Position: *{zone}*\n"
+            f"`LOWER [{bar}] UPPER`\n"
+            f"Upper: `{bb['upper']}`\n"
+            f"Middle: `{bb['middle']}`\n"
+            f"Lower: `{bb['lower']}`\n"
+            f"Width: `{bb['width_pct']}%`\n"
             f"💰 Price: {fmt_price(price)}\n\n"
             f"{chart}"
         )
@@ -890,6 +991,54 @@ async def rsi_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+# === /bb ===
+
+async def bb_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    args = context.args or []
+
+    if not args:
+        await update.message.reply_text(
+            "〰️ *Bollinger Bands* — pick a coin:",
+            parse_mode="Markdown",
+            reply_markup=coin_picker_keyboard("bb"),
+        )
+        return
+
+    pair = resolve_pair(args[0])
+    data = await fetch_klines(pair, interval="1h", limit=100)
+    if not data:
+        await update.message.reply_text(f"❌ Can't fetch {pair}. Try: BTC, ETH, SOL, etc.")
+        return
+
+    closes = [float(c[4]) for c in data]
+    price = closes[-1]
+    chart = ascii_chart(closes)
+    bb = compute_bollinger_bands(closes)
+
+    if bb is None:
+        await update.message.reply_text(f"❌ Not enough data for {pair}.")
+        return
+
+    zone = bollinger_zone_label(bb["zone"])
+    bar = bollinger_bar(bb["percent_b"])
+    msg = (
+        f"〰️ *{pair}* Bollinger Bands(20,2) 1h\n"
+        f"━━━━━━━━━━━━━━━\n"
+        f"Position: *{zone}*\n"
+        f"`LOWER [{bar}] UPPER`\n"
+        f"Upper: `{bb['upper']}`\n"
+        f"Middle: `{bb['middle']}`\n"
+        f"Lower: `{bb['lower']}`\n"
+        f"Width: `{bb['width_pct']}%`\n"
+        f"💰 Price: {fmt_price(price)}\n\n"
+        f"{chart}"
+    )
+
+    await update.message.reply_text(msg, parse_mode="Markdown")
+
+
 # === /scan ===
 
 SCAN_COINS = ["BTC", "ETH", "SOL", "BNB", "XRP", "AVAX", "ATOM", "LINK", "SUI", "INIT"]
@@ -1213,7 +1362,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "━━━━━━━━━━━━━━━\n\n"
         "📊 *Technical*\n"
         "  /macd `[PAIR]` — MACD crossover\n"
-        "  /rsi `[PAIR]` — RSI overbought/oversold\n\n"
+        "  /rsi `[PAIR]` — RSI overbought/oversold\n"
+        "  /bb `[PAIR]` — Bollinger Bands position\n\n"
         "💰 *Price*\n"
         "  /price `[PAIR]` — price + 24h change\n"
         "  /coins — list supported coins\n\n"
@@ -1556,6 +1706,7 @@ async def post_init(application: Application):
         BotCommand("macd", "📊 MACD crossover check"),
         BotCommand("price", "💰 Price + 24h change"),
         BotCommand("rsi", "📉 RSI overbought/oversold"),
+        BotCommand("bb", "〰️ Bollinger Bands position"),
         BotCommand("coins", "🪙 List supported coins"),
         BotCommand("scan", "🔍 Multi-indicator signal scan"),
         BotCommand("fng", "😱 Fear & Greed index"),
@@ -1581,6 +1732,7 @@ def main():
     app.add_handler(CommandHandler("macd", macd_command))
     app.add_handler(CommandHandler("price", price_command))
     app.add_handler(CommandHandler("rsi", rsi_command))
+    app.add_handler(CommandHandler("bb", bb_command))
     app.add_handler(CommandHandler("coins", coins_command))
     app.add_handler(CommandHandler("scan", scan_command))
     app.add_handler(CommandHandler("fng", fng_command))
