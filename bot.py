@@ -11,6 +11,9 @@ Commands:
   /rsi [PAIR]                     — RSI(14) overbought/oversold
   /fng                            — Fear & Greed index
   /dom                            — BTC dominance
+  /portfolio COIN PRICE           — add paper trade position
+  /portfolio                      — show all positions with P&L
+  /portfolio remove COIN [INDEX]  — remove position(s)
   /start                          — show all commands
 """
 
@@ -33,6 +36,7 @@ _DATA_DIR = "/data" if os.path.isdir("/data") else "/tmp"
 WATCHLIST_FILE = os.environ.get("WATCHLIST_FILE", f"{_DATA_DIR}/macd_watchlist.json")
 DAILY_FILE = os.environ.get("DAILY_FILE", f"{_DATA_DIR}/macd_daily.json")
 CROSS_STATE_FILE = f"{_DATA_DIR}/macd_cross_state.json"
+PORTFOLIO_FILE = os.environ.get("PORTFOLIO_FILE", "/tmp/macd_portfolio.json")
 MAX_WATCHES = 20
 DAILY_HOUR_UTC = int(os.environ.get("DAILY_HOUR_UTC", "2"))   # 02:00 UTC = 09:00 BKK
 DAILY_MINUTE_UTC = int(os.environ.get("DAILY_MINUTE_UTC", "0"))
@@ -343,6 +347,22 @@ def load_cross_state() -> dict:
 
 def save_cross_state(state: dict):
     Path(CROSS_STATE_FILE).write_text(json.dumps(state))
+
+
+# === Portfolio (paper trades) ===
+# Format: {user_id: [{"coin": "BTC", "entry_price": 50000.0, "timestamp": "2026-04-29T12:00:00Z"}]}
+
+def load_portfolio() -> dict:
+    if Path(PORTFOLIO_FILE).exists():
+        try:
+            return json.loads(Path(PORTFOLIO_FILE).read_text())
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return {}
+
+
+def save_portfolio(pf: dict):
+    Path(PORTFOLIO_FILE).write_text(json.dumps(pf, indent=2))
 
 
 # === Daily config ===
@@ -1211,6 +1231,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔍 *Scan*\n"
         "  /scan `[PAIR]` — multi-indicator verdict\n"
         "  /scan all — full market scan\n\n"
+        "📋 *Portfolio*\n"
+        "  /portfolio `COIN` `PRICE` — add paper trade\n"
+        "  /portfolio — show all positions + P&L\n"
+        "  /portfolio remove `COIN` `[N]` — remove position\n\n"
         "🔧 *Status*\n"
         "  /status — bot health + jobs\n\n"
         "Pairs: BTC, ETH, SOL, etc. or BTCUSDT\n"
@@ -1310,6 +1334,147 @@ async def interval_check(context: ContextTypes.DEFAULT_TYPE):
         save_cross_state(cross_state)
 
 
+# === /portfolio ===
+
+async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Paper trade tracker. /portfolio BTC 50000 → add position. /portfolio → show all with P&L."""
+    if not update.message:
+        return
+    args = context.args or []
+    user_id = str(update.effective_user.id)
+    pf = load_portfolio()
+
+    # /portfolio list — same as /portfolio (no args), explicit alias
+    if args and args[0].lower() == "list":
+        args = []
+
+    # /portfolio remove COIN [INDEX] — delete a position
+    if args and args[0].lower() == "remove":
+        if len(args) < 2:
+            await update.message.reply_text(
+                "Usage: `/portfolio remove BTC [1]`\nOmit index to remove all positions for that coin.",
+                parse_mode="Markdown",
+            )
+            return
+        coin = args[1].upper()
+        positions = pf.get(user_id, [])
+        if not positions:
+            await update.message.reply_text("📭 You have no open positions.")
+            return
+
+        if len(args) >= 3 and args[2].isdigit():
+            idx = int(args[2]) - 1  # 1-based for user
+            if idx < 0 or idx >= len(positions) or positions[idx]["coin"] != coin:
+                await update.message.reply_text(f"❌ No position #{args[2]} for {coin}.")
+                return
+            positions.pop(idx)
+        else:
+            before = len(positions)
+            positions = [p for p in positions if p["coin"] != coin]
+            removed = before - len(positions)
+            if removed == 0:
+                await update.message.reply_text(f"❌ No {coin} positions found.")
+                return
+
+        if positions:
+            pf[user_id] = positions
+        else:
+            pf.pop(user_id, None)
+        save_portfolio(pf)
+        await update.message.reply_text(f"🗑️ Removed {coin} position(s).", parse_mode="Markdown")
+        return
+
+    # /portfolio COIN PRICE — add a new position
+    if len(args) >= 2:
+        coin = args[0].upper()
+        try:
+            entry_price = float(args[1].replace(",", ""))
+        except ValueError:
+            await update.message.reply_text("❌ Invalid price. Usage: `/portfolio BTC 50000`", parse_mode="Markdown")
+            return
+
+        if entry_price <= 0:
+            await update.message.reply_text("❌ Price must be positive.", parse_mode="Markdown")
+            return
+
+        timestamp = datetime.utcnow().isoformat() + "Z"
+        positions = pf.get(user_id, [])
+        positions.append({"coin": coin, "entry_price": entry_price, "timestamp": timestamp})
+        pf[user_id] = positions
+        save_portfolio(pf)
+        await update.message.reply_text(
+            f"📝 *Paper Trade Added*\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"🪙 Coin: *{coin}*\n"
+            f"💰 Entry: {fmt_price(entry_price)}\n"
+            f"🕐 {timestamp[:19]}\n"
+            f"📊 Positions: {len(positions)}",
+            parse_mode="Markdown",
+        )
+        return
+
+    # /portfolio (no args) — show all positions with P&L
+    positions = pf.get(user_id, [])
+    if not positions:
+        await update.message.reply_text(
+            "📭 *No open paper trades.*\n"
+            "━━━━━━━━━━━━━━━\n"
+            "Add one: `/portfolio BTC 50000`\n"
+            "Remove: `/portfolio remove BTC`",
+            parse_mode="Markdown",
+        )
+        return
+
+    # Fetch live prices for each unique coin
+    unique_coins = set(p["coin"] for p in positions)
+    live_prices: dict[str, float] = {}
+    for coin in unique_coins:
+        pair = resolve_pair(coin)
+        try:
+            ticker = await fetch_ticker(pair)
+            if ticker:
+                live_prices[coin] = float(ticker["lastPrice"])
+        except Exception:
+            pass
+
+    # Build position list with P&L
+    total_pnl = 0.0
+    lines = [
+        f"📋 *Paper Portfolio*\n"
+        f"━━━━━━━━━━━━━━━",
+    ]
+    for i, pos in enumerate(positions, 1):
+        coin = pos["coin"]
+        entry = pos["entry_price"]
+        ts = pos["timestamp"][:10]  # date only
+        live = live_prices.get(coin)
+        if live:
+            pnl_pct = ((live - entry) / entry) * 100
+            pnl_abs = live - entry
+            total_pnl += pnl_pct
+            sign = "+" if pnl_pct > 0 else ""
+            emoji = "🟢" if pnl_pct > 0 else ("🔴" if pnl_pct < 0 else "⚪")
+            lines.append(
+                f"\n{emoji} {i}. *{coin}* — Entry {fmt_price(entry)} → Now {fmt_price(live)}\n"
+                f"    P&L: {sign}{pnl_pct:.2f}% ({sign}{fmt_price(abs(pnl_abs))}) · since {ts}"
+            )
+        else:
+            lines.append(
+                f"\n⚪ {i}. *{coin}* — Entry {fmt_price(entry)} · since {ts}\n"
+                f"    ⚠️ Live price unavailable"
+            )
+
+    # Summary
+    avg_pnl = total_pnl / len(positions) if positions else 0
+    sign = "+" if avg_pnl > 0 else ""
+    emoji = "📈" if avg_pnl > 0 else ("📉" if avg_pnl < 0 else "➖")
+    lines.append(
+        f"\n\n{emoji} *Avg P&L: {sign}{avg_pnl:.2f}%* across {len(positions)} position(s)"
+    )
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 # === /export ===
 
 async def export_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1396,6 +1561,7 @@ async def post_init(application: Application):
         BotCommand("fng", "😱 Fear & Greed index"),
         BotCommand("dom", "🏛️ BTC dominance"),
         BotCommand("daily", "📅 Daily snapshot on/off"),
+        BotCommand("portfolio", "📋 Paper trade tracker"),
         BotCommand("status", "🔧 Bot health + job status"),
         BotCommand("start", "⚡ Show all commands"),
     ])
@@ -1421,6 +1587,7 @@ def main():
     app.add_handler(CommandHandler("dom", dom_command))
     app.add_handler(CommandHandler("daily", daily_command))
     app.add_handler(CommandHandler("status", status_command))
+    app.add_handler(CommandHandler("portfolio", portfolio_command))
     app.add_handler(CommandHandler("export", export_command))
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(coin_picker_callback))
