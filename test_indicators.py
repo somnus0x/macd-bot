@@ -9,6 +9,7 @@ from bot import (
     compute_ema_trend,
     compute_macd,
     compute_rsi,
+    compute_stochastic,
     composite_signal,
     ema,
 )
@@ -137,6 +138,88 @@ def test_compute_ema_trend_shape_and_values_for_rising_closes():
 
 def test_compute_ema_trend_returns_none_for_insufficient_closes():
     assert compute_ema_trend([float(i) for i in range(49)]) is None
+
+
+def test_compute_stochastic_known_textbook_values():
+    highs = [10, 12, 14, 13, 15]
+    lows = [8, 9, 10, 9, 11]
+    closes = [9, 11, 13, 12, 14]
+
+    result = compute_stochastic(highs, lows, closes, k_period=3, d_period=2)
+
+    # %K(idx 2-4): 100*(14-9)/(15-9) = 83.3333 -> 83.33
+    # %K(idx 1-3): 100*(12-9)/(14-9) = 60.0
+    # %D = (83.3333 + 60.0) / 2 = 71.6667 -> 71.67
+    assert result == {"k": 83.33, "d": 71.67}
+
+
+def test_compute_stochastic_returns_none_for_insufficient_candles():
+    highs = [float(i) + 2 for i in range(13)]
+    lows = [float(i) for i in range(13)]
+    closes = [float(i) + 1 for i in range(13)]
+
+    assert compute_stochastic(highs, lows, closes) is None
+
+
+def test_compute_stochastic_d_period_boundary():
+    highs = [float(i) + 2 for i in range(16)]
+    lows = [float(i) for i in range(16)]
+    closes = [float(i) + 1 for i in range(16)]
+
+    assert compute_stochastic(highs[:15], lows[:15], closes[:15]) is None
+
+    result = compute_stochastic(highs, lows, closes)
+    assert result is not None
+    assert isinstance(result["k"], (int, float))
+    assert isinstance(result["d"], (int, float))
+
+
+def test_compute_stochastic_flat_range_is_neutral():
+    highs = [5.0] * 16
+    lows = [5.0] * 16
+    closes = [5.0] * 16
+
+    result = compute_stochastic(highs, lows, closes)
+
+    assert result == {"k": 50.0, "d": 50.0}
+
+
+def test_compute_stochastic_honors_custom_periods():
+    highs = [float(i) + 3 for i in range(20)]
+    lows = [float(i) for i in range(20)]
+    closes = [float(i) + 1.5 for i in range(20)]
+
+    default_result = compute_stochastic(highs, lows, closes)
+    custom_result = compute_stochastic(highs, lows, closes, k_period=5, d_period=2)
+
+    assert default_result is not None
+    assert custom_result is not None
+    assert default_result != custom_result
+
+
+def test_compute_stochastic_rounds_to_two_decimals():
+    highs = [10, 12, 14, 13, 15]
+    lows = [8, 9, 10, 9, 11]
+    closes = [9, 11, 13, 12, 14]
+
+    result = compute_stochastic(highs, lows, closes, k_period=3, d_period=2)
+
+    assert round(result["k"], 2) == result["k"]
+    assert round(result["d"], 2) == result["d"]
+
+
+def test_compute_stochastic_result_is_all_or_nothing():
+    highs = [float(i) + 2 for i in range(16)]
+    lows = [float(i) for i in range(16)]
+    closes = [float(i) + 1 for i in range(16)]
+
+    result = compute_stochastic(highs, lows, closes)
+
+    assert result is not None
+    assert result["k"] is not None
+    assert result["d"] is not None
+    assert isinstance(result["k"], (int, float))
+    assert isinstance(result["d"], (int, float))
 
 
 def test_composite_signal_shape_and_nested_indicator_outputs():

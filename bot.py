@@ -179,6 +179,36 @@ def compute_bollinger_bands(
     }
 
 
+def compute_stochastic(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    k_period: int = 14,
+    d_period: int = 3,
+) -> dict | None:
+    if len(closes) < k_period + d_period - 1:
+        return None
+
+    k_values = []
+    for i in range(k_period - 1, len(closes)):
+        window_highs = highs[i - k_period + 1:i + 1]
+        window_lows = lows[i - k_period + 1:i + 1]
+        highest_high = max(window_highs)
+        lowest_low = min(window_lows)
+        band = highest_high - lowest_low
+        if band == 0:
+            k_values.append(50.0)
+        else:
+            k_values.append(100 * (closes[i] - lowest_low) / band)
+
+    latest_k = k_values[-1]
+    latest_d = sum(k_values[-d_period:]) / d_period
+    return {
+        "k": round(latest_k, 2),
+        "d": round(latest_d, 2),
+    }
+
+
 def compute_ema_trend(closes: list[float]) -> dict | None:
     """EMA20/50 trend: price position relative to moving averages."""
     if len(closes) < 50:
