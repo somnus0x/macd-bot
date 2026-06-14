@@ -309,6 +309,18 @@ def composite_signal(closes: list[float], klines: list) -> dict:
         else:
             signals.append("BB middle range")
 
+    # Stochastic (context only)
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    stoch = compute_stochastic(highs, lows, closes)
+    if stoch:
+        if stoch["k"] > 80:
+            signals.append(f"Stochastic overbought (%K {stoch['k']})")
+        elif stoch["k"] < 20:
+            signals.append(f"Stochastic oversold (%K {stoch['k']})")
+        else:
+            signals.append(f"Stochastic midrange (%K {stoch['k']})")
+
     # Volume confirmation (weight: 20)
     vol = compute_volume_trend(klines)
     if vol:
@@ -343,6 +355,7 @@ def composite_signal(closes: list[float], klines: list) -> dict:
         "ema": ema_t,
         "bollinger": bb,
         "volume": vol,
+        "stochastic": stoch,
     }
 
 

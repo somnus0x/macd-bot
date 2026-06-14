@@ -235,6 +235,7 @@ def test_composite_signal_shape_and_nested_indicator_outputs():
         "ema",
         "bollinger",
         "volume",
+        "stochastic",
     }
     assert result["score"] == -10
     assert result["verdict"] == "NEUTRAL"
@@ -244,3 +245,81 @@ def test_composite_signal_shape_and_nested_indicator_outputs():
     assert result["ema"]["ema20"] == pytest.approx(50.5)
     assert result["bollinger"]["zone"] == "NEAR_UPPER"
     assert result["volume"]["ratio"] == pytest.approx(1.0)
+    assert result["stochastic"] == {"k": 50.0, "d": 50.0}
+
+
+def ohlc_klines(count, high, low, close, volume=100.0):
+    return [[0, 0, high, low, close, volume] for _ in range(count)]
+
+
+def _stochastic_signals(result):
+    return [s for s in result["signals"] if "Stochastic" in s]
+
+
+def test_composite_appends_stochastic_overbought_context():
+    closes = [90.0] * 60
+    result = composite_signal(closes, ohlc_klines(60, 100.0, 0.0, 90.0))
+
+    assert result["stochastic"]["k"] == 90.0
+    stoch = _stochastic_signals(result)
+    assert len(stoch) == 1
+    assert "overbought" in stoch[0].lower()
+    assert all("BB" not in s for s in stoch)
+
+
+def test_composite_appends_stochastic_oversold_context():
+    closes = [10.0] * 60
+    result = composite_signal(closes, ohlc_klines(60, 100.0, 0.0, 10.0))
+
+    assert result["stochastic"]["k"] == 10.0
+    stoch = _stochastic_signals(result)
+    assert len(stoch) == 1
+    assert "oversold" in stoch[0].lower()
+    assert all("BB" not in s for s in stoch)
+
+
+def test_composite_appends_stochastic_midrange_context():
+    closes = [50.0] * 60
+    result = composite_signal(closes, ohlc_klines(60, 100.0, 0.0, 50.0))
+
+    assert result["stochastic"]["k"] == 50.0
+    stoch = _stochastic_signals(result)
+    assert len(stoch) == 1
+    assert "overbought" not in stoch[0].lower()
+    assert "oversold" not in stoch[0].lower()
+
+
+def test_composite_stochastic_strict_overbought_threshold_is_midrange():
+    closes = [80.0] * 60
+    result = composite_signal(closes, ohlc_klines(60, 100.0, 0.0, 80.0))
+
+    assert result["stochastic"]["k"] == 80.0
+    stoch = _stochastic_signals(result)
+    assert len(stoch) == 1
+    assert "overbought" not in stoch[0].lower()
+
+
+def test_composite_stochastic_strict_oversold_threshold_is_midrange():
+    closes = [20.0] * 60
+    result = composite_signal(closes, ohlc_klines(60, 100.0, 0.0, 20.0))
+
+    assert result["stochastic"]["k"] == 20.0
+    stoch = _stochastic_signals(result)
+    assert len(stoch) == 1
+    assert "oversold" not in stoch[0].lower()
+
+
+def test_composite_stochastic_none_when_klines_too_short():
+    closes = [float(i) for i in range(1, 11)]
+    result = composite_signal(closes, ohlc_klines(10, 100.0, 0.0, 5.0))
+
+    assert result["stochastic"] is None
+    assert _stochastic_signals(result) == []
+
+
+def test_composite_stochastic_is_context_only_score_unchanged():
+    closes = [float(i) for i in range(1, 61)]
+    result = composite_signal(closes, flat_klines(60))
+
+    assert result["score"] == -10
+    assert result["verdict"] == "NEUTRAL"
