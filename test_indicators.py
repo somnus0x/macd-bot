@@ -5,6 +5,7 @@ import pytest
 os.environ.setdefault("TELEGRAM_BOT_TOKEN", "test-token")
 
 from bot import (
+    compute_atr,
     compute_bollinger_bands,
     compute_ema_trend,
     compute_macd,
@@ -222,6 +223,56 @@ def test_compute_stochastic_result_is_all_or_nothing():
     assert isinstance(result["d"], (int, float))
 
 
+# 25-candle textbook series (period=14). Clean-room Wilder reference = 2.5994;
+# SMA-of-TR (2.7971) and EMA-of-TR (2.7388) diverge here — that divergence is
+# how the canonical Wilder implementation was selected over the alternatives.
+ATR_TXT_H = [50.29, 50.47, 49.18, 49.57, 50.97, 51.26, 50.13, 50.2, 49.36, 50.7,
+             50.86, 50.43, 51.18, 51.03, 50.28, 50.93, 51.74, 51.31, 53.5, 51.68,
+             50.21, 49.48, 48.68, 50.19, 50.89]
+ATR_TXT_L = [49.15, 48.85, 47.73, 47.02, 47.17, 50.26, 48.89, 47.53, 48.65, 48.62,
+             48.76, 47.37, 49.39, 48.27, 46.94, 48.92, 48.77, 48.67, 49.35, 49.35,
+             49.11, 47.72, 46.06, 47.06, 47.1]
+ATR_TXT_C = [49.57, 49.84, 48.46, 48.36, 48.93, 50.65, 49.63, 48.73, 49.03, 49.78,
+             49.77, 49.08, 49.99, 49.87, 48.5, 49.89, 50.3, 50.36, 51.0, 50.77,
+             49.83, 48.75, 47.52, 48.72, 48.41]
+
+
+def test_compute_atr_known_textbook_wilder_value():
+    assert compute_atr(ATR_TXT_H, ATR_TXT_L, ATR_TXT_C) == 2.5994
+
+
+def test_compute_atr_flat_price_is_zero():
+    flat = [100.0] * 20
+    assert compute_atr(flat, flat, flat) == 0.0
+
+
+def test_compute_atr_returns_none_for_insufficient_candles():
+    # Exactly `period` candles -> only period-1 true ranges -> None.
+    highs = [100.0 + i for i in range(14)]
+    lows = [99.0 + i for i in range(14)]
+    closes = [99.5 + i for i in range(14)]
+    assert compute_atr(highs, lows, closes) is None
+    # One more candle (period + 1) crosses the threshold.
+    assert compute_atr(highs + [114.0], lows + [113.0], closes + [113.5]) is not None
+
+
+def test_compute_atr_gap_up_uses_previous_close():
+    # Gap candle TR = max(30-28, |30-10|, |28-10|) = 20 (gap term dominates);
+    # a high-low-only TR would give 2.0. Wilder over [2, 20, 2], period=2 -> 6.5.
+    highs = [10.0, 11.0, 30.0, 31.0]
+    lows = [8.0, 9.0, 28.0, 29.0]
+    closes = [9.0, 10.0, 29.0, 30.0]
+    atr = compute_atr(highs, lows, closes, period=2)
+    assert atr == 6.5
+    assert atr != 2.0  # did not ignore the gap from the previous close
+
+
+def test_compute_atr_rounds_to_four_decimals():
+    atr = compute_atr(ATR_TXT_H, ATR_TXT_L, ATR_TXT_C)
+    assert round(atr, 4) == atr   # no more than 4 decimals
+    assert round(atr, 2) != atr   # genuinely price-scale (>2 decimals), not oscillator-style
+
+
 def test_composite_signal_shape_and_nested_indicator_outputs():
     closes = [float(i) for i in range(1, 61)]
     result = composite_signal(closes, flat_klines(60))
@@ -236,6 +287,7 @@ def test_composite_signal_shape_and_nested_indicator_outputs():
         "bollinger",
         "volume",
         "stochastic",
+        "atr",
     }
     assert result["score"] == -10
     assert result["verdict"] == "NEUTRAL"
@@ -246,6 +298,7 @@ def test_composite_signal_shape_and_nested_indicator_outputs():
     assert result["bollinger"]["zone"] == "NEAR_UPPER"
     assert result["volume"]["ratio"] == pytest.approx(1.0)
     assert result["stochastic"] == {"k": 50.0, "d": 50.0}
+    assert isinstance(result["atr"], float)
 
 
 def ohlc_klines(count, high, low, close, volume=100.0):
@@ -318,6 +371,58 @@ def test_composite_stochastic_none_when_klines_too_short():
 
 
 def test_composite_stochastic_is_context_only_score_unchanged():
+    closes = [float(i) for i in range(1, 61)]
+    result = composite_signal(closes, flat_klines(60))
+
+    assert result["score"] == -10
+
+
+def _atr_signals(result):
+    return [s for s in result["signals"] if s.startswith("ATR")]
+
+
+def test_composite_appends_atr_elevated_volatility_context():
+    closes = [100.0] * 60
+    # TR = max(110-90, |110-100|, |90-100|) = 20 -> 20% of price (>= 4).
+    result = composite_signal(closes, ohlc_klines(60, 110.0, 90.0, 100.0))
+
+    assert result["atr"] == 20.0
+    atr = _atr_signals(result)
+    assert len(atr) == 1
+    assert "elevated" in atr[0].lower()
+
+
+def test_composite_appends_atr_low_volatility_context():
+    closes = [100.0] * 60
+    # TR = max(100.5-99.5, |100.5-100|, |99.5-100|) = 1.0 -> 1.0% of price (<= 1).
+    result = composite_signal(closes, ohlc_klines(60, 100.5, 99.5, 100.0))
+
+    assert result["atr"] == 1.0
+    atr = _atr_signals(result)
+    assert len(atr) == 1
+    assert "low" in atr[0].lower()
+
+
+def test_composite_appends_atr_normal_volatility_context():
+    closes = [100.0] * 60
+    # TR = max(101.5-98.5, |101.5-100|, |98.5-100|) = 3.0 -> 3.0% of price (between).
+    result = composite_signal(closes, ohlc_klines(60, 101.5, 98.5, 100.0))
+
+    assert result["atr"] == 3.0
+    atr = _atr_signals(result)
+    assert len(atr) == 1
+    assert "normal" in atr[0].lower()
+
+
+def test_composite_atr_none_when_klines_too_short():
+    closes = [float(i) for i in range(1, 11)]
+    result = composite_signal(closes, ohlc_klines(10, 100.0, 0.0, 5.0))
+
+    assert result["atr"] is None
+    assert _atr_signals(result) == []
+
+
+def test_composite_atr_is_context_only_score_unchanged():
     closes = [float(i) for i in range(1, 61)]
     result = composite_signal(closes, flat_klines(60))
 

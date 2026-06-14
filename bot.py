@@ -247,6 +247,34 @@ def compute_volume_trend(klines: list) -> dict | None:
     }
 
 
+def compute_atr(
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    period: int = 14,
+) -> float | None:
+    """Wilder's Average True Range — volatility in absolute price units."""
+    # Need `period` true ranges; N candles yield N-1 of them (the first candle
+    # has no prior close), so require period + 1 closes. Mirrors compute_rsi.
+    if len(closes) < period + 1:
+        return None
+
+    true_ranges = []
+    for i in range(1, len(closes)):
+        prev_close = closes[i - 1]
+        true_ranges.append(max(
+            highs[i] - lows[i],
+            abs(highs[i] - prev_close),
+            abs(lows[i] - prev_close),
+        ))
+
+    atr = sum(true_ranges[:period]) / period  # first ATR = SMA of first `period` TRs
+    for tr in true_ranges[period:]:           # Wilder smoothing over the remainder
+        atr = (atr * (period - 1) + tr) / period
+
+    return round(atr, 4)
+
+
 def composite_signal(closes: list[float], klines: list) -> dict:
     """TrueNorth-style multi-indicator composite verdict.
     Score: -100 (STRONG_SELL) to +100 (STRONG_BUY)."""
@@ -321,6 +349,18 @@ def composite_signal(closes: list[float], klines: list) -> dict:
         else:
             signals.append(f"Stochastic midrange (%K {stoch['k']})")
 
+    # ATR volatility (context only)
+    atr = compute_atr(highs, lows, closes)
+    if atr is not None:
+        price = closes[-1]
+        atr_pct = (atr / price * 100) if price else 0.0
+        if atr_pct >= 4:
+            signals.append(f"ATR elevated volatility ({atr_pct:.1f}% of price)")
+        elif atr_pct <= 1:
+            signals.append(f"ATR low volatility ({atr_pct:.1f}% of price)")
+        else:
+            signals.append(f"ATR normal volatility ({atr_pct:.1f}% of price)")
+
     # Volume confirmation (weight: 20)
     vol = compute_volume_trend(klines)
     if vol:
@@ -356,6 +396,7 @@ def composite_signal(closes: list[float], klines: list) -> dict:
         "bollinger": bb,
         "volume": vol,
         "stochastic": stoch,
+        "atr": atr,
     }
 
 
