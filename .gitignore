@@ -2,3 +2,5 @@
 __pycache__/
 *.pyc
 macd_watchlist.json
+.venv/
+.mission-readiness-*.md
