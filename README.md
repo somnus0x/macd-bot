@@ -16,6 +16,7 @@ candles and grown into a multi-indicator toolkit. No API keys needed for market 
 - `/scan [PAIR]` — multi-indicator composite verdict (`/scan all` for full market)
 - `/fng` — Fear & Greed index
 - `/dom` — BTC dominance
+- `/kelly WIN_RATE REWARD_RISK [BANKROLL]` — Kelly Criterion position sizing
 - `/daily on|off|now` — daily snapshot
 - `/portfolio COIN PRICE` — add paper trade (`/portfolio` to show P&L, `/portfolio remove COIN [N]`)
 - `/status` — bot health + job status
@@ -30,6 +31,8 @@ candles and grown into a multi-indicator toolkit. No API keys needed for market 
 - **Stochastic Oscillator** — fast %K/%D (14,3). Context-only signal in the composite
   `/scan`: overbought when %K > 80, oversold when %K < 20, midrange otherwise. It does
   not adjust the score and there is no standalone command for it.
+- **Kelly Criterion** — risk sizing helper via `/kelly`; accepts win rate as `55`,
+  `55%`, or `0.55`, reward:risk as net R multiple, and optional bankroll.
 
 ## Deploy to Railway
 

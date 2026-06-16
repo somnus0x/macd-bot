@@ -12,6 +12,7 @@ Commands:
   /bb [PAIR]                      — Bollinger Bands(20,2) position
   /fng                            — Fear & Greed index
   /dom                            — BTC dominance
+  /kelly WIN_RATE REWARD_RISK [BANKROLL] — Kelly position sizing
   /portfolio COIN PRICE           — add paper trade position
   /portfolio                      — show all positions with P&L
   /portfolio remove COIN [INDEX]  — remove position(s)
@@ -273,6 +274,34 @@ def compute_atr(
         atr = (atr * (period - 1) + tr) / period
 
     return round(atr, 4)
+
+
+def compute_kelly_fraction(win_probability: float, reward_risk: float) -> dict:
+    """Kelly Criterion position sizing from win probability and reward:risk.
+
+    `win_probability` is a decimal in [0, 1]. `reward_risk` is net odds, e.g.
+    2.0 for a trade risking 1R to make 2R. The raw Kelly fraction may be
+    negative when there is no edge; the conservative half-Kelly size floors at 0.
+    """
+    if not 0 <= win_probability <= 1:
+        raise ValueError("win_probability must be between 0 and 1")
+    if reward_risk <= 0:
+        raise ValueError("reward_risk must be positive")
+
+    loss_probability = 1 - win_probability
+    edge = win_probability * reward_risk - loss_probability
+    kelly_fraction = edge / reward_risk
+    half_kelly_fraction = max(kelly_fraction, 0.0) / 2
+
+    return {
+        "win_probability": round(win_probability, 4),
+        "loss_probability": round(loss_probability, 4),
+        "reward_risk": round(reward_risk, 4),
+        "edge": round(edge, 4),
+        "kelly_fraction": round(kelly_fraction, 4),
+        "half_kelly_fraction": round(half_kelly_fraction, 4),
+        "has_edge": kelly_fraction > 0,
+    }
 
 
 def composite_signal(closes: list[float], klines: list) -> dict:
@@ -615,6 +644,23 @@ def bollinger_zone_label(zone: str) -> str:
 def bollinger_bar(percent_b: float, width: int = 20) -> str:
     pos = max(0, min(width, round(percent_b * width)))
     return "░" * pos + "█" + "░" * (width - pos)
+
+
+def parse_probability(text: str) -> float:
+    """Accept `55`, `55%`, or `0.55` as a probability."""
+    raw = text.strip().rstrip("%")
+    value = float(raw)
+    if value > 1:
+        value = value / 100
+    return value
+
+
+def fmt_pct(value: float) -> str:
+    return f"{value * 100:.2f}%"
+
+
+def fmt_money(value: float) -> str:
+    return f"${value:,.2f}"
 
 
 # === Inline coin picker ===
@@ -1282,6 +1328,65 @@ async def dom_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(msg, parse_mode="Markdown")
 
 
+# === /kelly ===
+
+async def kelly_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+    args = context.args or []
+
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Usage: `/kelly WIN_RATE REWARD_RISK [BANKROLL]`\n"
+            "Example: `/kelly 55 2 1000` = 55% win rate, 2R reward for 1R risk.",
+            parse_mode="Markdown",
+        )
+        return
+
+    try:
+        win_probability = parse_probability(args[0])
+        reward_risk = float(args[1].replace("R", "").replace("r", ""))
+        bankroll = float(args[2].replace(",", "")) if len(args) >= 3 else None
+        result = compute_kelly_fraction(win_probability, reward_risk)
+    except ValueError:
+        await update.message.reply_text(
+            "❌ Invalid inputs. Use win rate 0-100 and positive reward:risk.\n"
+            "Example: `/kelly 55 2 1000`",
+            parse_mode="Markdown",
+        )
+        return
+
+    edge = result["edge"]
+    full = result["kelly_fraction"]
+    half = result["half_kelly_fraction"]
+    edge_label = "✅ positive edge" if result["has_edge"] else "⚠️ no positive edge"
+    lines = [
+        "🎯 *Kelly Criterion*",
+        "━━━━━━━━━━━━━━━",
+        f"Win rate: *{fmt_pct(result['win_probability'])}*",
+        f"Reward:Risk: *{result['reward_risk']:.2f}R*",
+        f"Edge: `{edge:.4f}R` — {edge_label}",
+        "",
+        f"Full Kelly: *{fmt_pct(full)}*",
+        f"Half Kelly: *{fmt_pct(half)}*",
+    ]
+
+    if bankroll is not None:
+        if bankroll <= 0:
+            await update.message.reply_text("❌ Bankroll must be positive.")
+            return
+        lines.extend([
+            "",
+            f"Bankroll: {fmt_money(bankroll)}",
+            f"Half-Kelly size: *{fmt_money(bankroll * half)}*",
+        ])
+
+    if not result["has_edge"]:
+        lines.append("\nNo position is suggested by Kelly.")
+
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+
 # === /daily ===
 
 async def daily_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1454,6 +1559,8 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🌡️ *Sentiment*\n"
         "  /fng — Fear & Greed index\n"
         "  /dom — BTC dominance\n\n"
+        "🎯 *Risk*\n"
+        "  /kelly `WIN%` `R:R` `[BANKROLL]` — Kelly sizing\n\n"
         "📅 *Daily*\n"
         "  /daily on — enable daily snapshot\n"
         "  /daily off — disable\n"
@@ -1795,6 +1902,7 @@ async def post_init(application: Application):
         BotCommand("scan", "🔍 Multi-indicator signal scan"),
         BotCommand("fng", "😱 Fear & Greed index"),
         BotCommand("dom", "🏛️ BTC dominance"),
+        BotCommand("kelly", "🎯 Kelly position sizing"),
         BotCommand("daily", "📅 Daily snapshot on/off"),
         BotCommand("portfolio", "📋 Paper trade tracker"),
         BotCommand("status", "🔧 Bot health + job status"),
@@ -1821,6 +1929,7 @@ def main():
     app.add_handler(CommandHandler("scan", scan_command))
     app.add_handler(CommandHandler("fng", fng_command))
     app.add_handler(CommandHandler("dom", dom_command))
+    app.add_handler(CommandHandler("kelly", kelly_command))
     app.add_handler(CommandHandler("daily", daily_command))
     app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("portfolio", portfolio_command))
